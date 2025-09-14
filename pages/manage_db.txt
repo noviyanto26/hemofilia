@@ -1,0 +1,1 @@
+sqlite_web "C:\Users\noviy\Documents\Python\hemofilia_app\pages\hemofilia.db" --host 127.0.0.1 --port 8080
