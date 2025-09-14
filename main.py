@@ -5,6 +5,17 @@ from pathlib import Path
 
 st.set_page_config(page_title="🩸 Hemofilia - Dashboard", page_icon="🩸", layout="wide")
 
+# Sembunyikan daftar halaman bawaan & tombol toggle di sidebar
+st.markdown("""
+<style>
+  /* Daftar halaman multipage default */
+  [data-testid="stSidebarNav"] { display: none !important; }
+  /* Tombol kecil untuk collapse/expand sidebar */
+  div[data-testid="collapsedControl"] { display: none !important; }
+</style>
+""", unsafe_allow_html=True)
+
+
 # =========================
 # Konfigurasi Menu & File
 # =========================
