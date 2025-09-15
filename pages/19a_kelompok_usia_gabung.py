@@ -8,7 +8,6 @@ from datetime import datetime
 import pandas as pd
 import plotly.express as px
 import streamlit as st
-from sqlalchemy import text
 
 from db import read_sql_df, exec_sql, table_exists, ping
 
@@ -48,16 +47,14 @@ def get_columns(table: str) -> List[str]:
             {"t": table}
         )
         if not df.empty:
-            return df["column_name"].tolist()
+            return df["column_name"].astype(str).tolist()
     except Exception:
         pass
 
     # SQLite fallback
     try:
         df = read_sql_df(f'PRAGMA table_info("{table}")')
-        # kolom "name" adalah nama kolom di PRAGMA table_info
         if not df.empty:
-            # compat: kadang pandas mengembalikan integer index (1) utk nama; prefer "name" jika ada
             if "name" in df.columns:
                 return df["name"].astype(str).tolist()
             elif 1 in df.columns:
@@ -116,7 +113,6 @@ def build_gabung():
     # Nama kolom yang biasa ada pada sumber
     ha_cols = ["ha_ringan", "ha_sedang", "ha_berat"]
     hb_cols = ["hb_ringan", "hb_sedang", "hb_berat"]
-    other_cols = ["hemo_tipe_lain", "vwd_tipe1", "vwd_tipe2"]
 
     def coalesce_or_zero(col: str) -> str:
         # jika kolom ada, pakai COALESCE(kol,0), jika tidak, pakai literal 0
@@ -142,7 +138,7 @@ def build_gabung():
         exec_sql(f"DELETE FROM {DST_TABLE}")
 
     # Insert dari sumber dengan penjumlahan & COALESCE agar NULL jadi 0
-    exec_sql(text(f"""
+    exec_sql(f"""
         INSERT INTO {DST_TABLE} (
             id, kode_organisasi, created_at, kelompok_usia,
             hemo_a, hemo_b, hemo_tipe_lain, vwd_tipe1, vwd_tipe2
@@ -158,7 +154,7 @@ def build_gabung():
             ({expr_vwd1})   AS vwd_tipe1,
             ({expr_vwd2})   AS vwd_tipe2
         FROM {SRC_TABLE}
-    """))
+    """)
 
 # ======================== Load & Tampilkan ========================
 def load_with_join() -> pd.DataFrame:
@@ -298,19 +294,19 @@ def upload_excel_to_db(df_upload: pd.DataFrame):
         kode = row["kode_organisasi"]
         ku = row["Kelompok Usia"]
         payload_del = {"kode": kode, "ku": ku}
-        exec_sql(text(f"DELETE FROM {DST_TABLE} WHERE kode_organisasi = :kode AND kelompok_usia = :ku"), payload_del)
+        exec_sql(f"DELETE FROM {DST_TABLE} WHERE kode_organisasi = :kode AND kelompok_usia = :ku", payload_del)
 
         payload_ins = {
             "kode": kode, "created_at": today, "ku": ku,
             "a": int(row["Hemofilia A"]), "b": int(row["Hemofilia B"]),
             "lain": int(row["Hemofilia Tipe Lain"]), "v1": int(row["vWD Tipe 1"]), "v2": int(row["vWD Tipe 2"]),
         }
-        exec_sql(text(f"""
+        exec_sql(f"""
             INSERT INTO {DST_TABLE} (
                 kode_organisasi, created_at, kelompok_usia,
                 hemo_a, hemo_b, hemo_tipe_lain, vwd_tipe1, vwd_tipe2
             ) VALUES (:kode, :created_at, :ku, :a, :b, :lain, :v1, :v2)
-        """), payload_ins)
+        """, payload_ins)
 
 # ======================== Main ========================
 def main():
