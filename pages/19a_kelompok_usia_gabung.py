@@ -1,46 +1,30 @@
+# pages/19a_kelompok_usia_gabung.py
 # -*- coding: utf-8 -*-
 import io
 import pandas as pd
 import streamlit as st
-from sqlalchemy import text
 
-# ====== Koneksi via util db.py (Postgres-ready dengan fallback SQLite) ======
-# db.py minimal menyediakan:
-# - get_engine(): sqlalchemy Engine
-# - exec_sql(sql: str, params: dict|None)
-from db import get_engine, exec_sql
+# Util DB (Postgres-ready via Supabase, fallback SQLite) — pastikan db.py terbaru sudah dipakai
+from db import exec_sql, fetch_df, is_postgres
 
 PAGE_TITLE = "🧮 Rekap Gabungan Kelompok Usia (Rebuild)"
 SRC_TABLE = "kelompok_usia"
 DST_TABLE = "kelompok_usia_gabung"
-ORG_TABLE = "identitas_organisasi"   # untuk ambil HMHI Cabang (join via kode_organisasi)
+ORG_TABLE = "identitas_organisasi"   # join via kode_organisasi
 
 st.set_page_config(page_title="Rekap Gabungan Kelompok Usia", page_icon="🧮", layout="wide")
 st.title(PAGE_TITLE)
 
-# ---------- fetch_df lokal (tanpa mengubah db.py) ----------
-def fetch_df(sql: str, params: dict | None = None) -> pd.DataFrame:
-    eng = get_engine()
-    with eng.connect() as conn:
-        return pd.read_sql_query(text(sql), conn, params=params or {})
-
-# ---------- Helper Dialect ----------
-def _is_postgres() -> bool:
-    try:
-        eng = get_engine()
-        return (eng.dialect.name or "").lower() in ("postgresql", "postgres")
-    except Exception:
-        return False
 
 # ---------- DDL: create table if not exists ----------
 def ensure_dst_table():
     """
-    Buat tabel gabungan jika belum ada (Postgres/SQLite aware).
+    Buat tabel gabungan jika belum ada (dialect-aware).
+    Untuk Postgres: pakai BIGSERIAL agar id punya default sequence.
     """
-    if _is_postgres():
-        # Postgres
+    if is_postgres():
         exec_sql(f"""
-        CREATE TABLE IF NOT EXISTS {DST_TABLE} (
+        CREATE TABLE IF NOT EXISTS public.{DST_TABLE} (
             id BIGSERIAL PRIMARY KEY,
             kode_organisasi VARCHAR(255),
             created_at TIMESTAMPTZ,
@@ -52,9 +36,8 @@ def ensure_dst_table():
             vwd_tipe2 INTEGER DEFAULT 0
         );
         """)
-        exec_sql(f"CREATE INDEX IF NOT EXISTS idx_{DST_TABLE}_kode_usia ON {DST_TABLE}(kode_organisasi, kelompok_usia);")
+        exec_sql(f"CREATE INDEX IF NOT EXISTS idx_{DST_TABLE}_kode_usia ON public.{DST_TABLE}(kode_organisasi, kelompok_usia);")
     else:
-        # SQLite
         exec_sql(f"""
         CREATE TABLE IF NOT EXISTS {DST_TABLE} (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -70,27 +53,70 @@ def ensure_dst_table():
         """)
         exec_sql(f"CREATE INDEX IF NOT EXISTS idx_{DST_TABLE}_kode_usia ON {DST_TABLE}(kode_organisasi, kelompok_usia);")
 
+
+# ---------- Postgres schema fixer: pasang default sequence pada kolom id jika hilang ----------
+def _pg_fix_id_default_if_needed():
+    """
+    Perbaiki default sequence kolom id jika tabel lama dibuat tanpa BIGSERIAL/IDENTITY.
+    Aman dijalankan berkali-kali (idempotent).
+    """
+    if not is_postgres():
+        return
+
+    q = """
+    SELECT column_default
+    FROM information_schema.columns
+    WHERE table_schema = 'public' AND table_name = 'kelompok_usia_gabung' AND column_name = 'id'
+    """
+    try:
+        df = fetch_df(q)
+        col_default = (df.iloc[0, 0] if not df.empty else None)
+    except Exception:
+        col_default = None
+
+    if not col_default:
+        exec_sql("""
+        DO $$
+        DECLARE
+          has_seq boolean;
+        BEGIN
+          SELECT EXISTS (
+            SELECT 1 FROM pg_class c
+            WHERE c.relkind = 'S' AND c.relname = 'kelompok_usia_gabung_id_seq'
+          ) INTO has_seq;
+
+          IF NOT has_seq THEN
+            EXECUTE 'CREATE SEQUENCE public.kelompok_usia_gabung_id_seq AS BIGINT START WITH 1 INCREMENT BY 1';
+          END IF;
+
+          EXECUTE 'ALTER SEQUENCE public.kelompok_usia_gabung_id_seq OWNED BY public.kelompok_usia_gabung.id';
+          EXECUTE 'ALTER TABLE public.kelompok_usia_gabung ALTER COLUMN id SET DEFAULT nextval(''public.kelompok_usia_gabung_id_seq'')';
+          EXECUTE 'SELECT setval(''public.kelompok_usia_gabung_id_seq'', COALESCE((SELECT MAX(id) FROM public.kelompok_usia_gabung), 0))';
+        END $$;
+        """)
+
+
 # ---------- REBUILD: truncate + insert (tanpa kolom id) ----------
 def rebuild_gabungan():
     """
-    Rebuild penuh dari sumber 'kelompok_usia' ke 'kelompok_usia_gabung'.
-    - Kosongkan tabel target + reset sequence/autoincrement
+    Rebuild penuh dari sumber 'kelompok_usia' ke 'kelompok_usia_gabung':
+    - Pastikan tabel ada
+    - Perbaiki default id (PG) jika hilang
+    - Kosongkan (TRUNCATE RESTART IDENTITY di PG / DELETE + reset di SQLite)
     - Insert agregasi tanpa menyertakan kolom 'id'
     """
     ensure_dst_table()
+    _pg_fix_id_default_if_needed()
 
-    if _is_postgres():
-        # Kosongkan dan reset identity (hindari UniqueViolation)
-        exec_sql(f"TRUNCATE TABLE {DST_TABLE} RESTART IDENTITY;")
+    if is_postgres():
+        exec_sql(f"TRUNCATE TABLE public.{DST_TABLE} RESTART IDENTITY;")
     else:
-        # SQLite: hapus isi + reset autoincrement
         exec_sql(f"DELETE FROM {DST_TABLE};")
         try:
             exec_sql(f"DELETE FROM sqlite_sequence WHERE name = '{DST_TABLE}';")
         except Exception:
             pass  # sqlite_sequence bisa belum ada
 
-    # Insert-agregasi dari sumber
     exec_sql(f"""
         INSERT INTO {DST_TABLE} (
             kode_organisasi, created_at, kelompok_usia,
@@ -108,20 +134,12 @@ def rebuild_gabungan():
         FROM {SRC_TABLE} ku
     """)
 
-    # (Opsional) sinkronkan sequence jika dulu pernah menyisipkan id manual
-    if _is_postgres():
-        exec_sql(f"""
-        SELECT setval(
-            pg_get_serial_sequence('{DST_TABLE}','id'),
-            COALESCE((SELECT MAX(id) FROM {DST_TABLE}), 0)
-        );
-        """)
 
 # ---------- READ: tampilan gabungan + join HMHI Cabang ----------
 def read_joined_df():
     """
-    Tampilkan data gabungan + HMHI Cabang.
-    Nama kolom HMHI di identitas_organisasi bisa bervariasi; dicoba beberapa kemungkinan.
+    Tampilkan data gabungan + HMHI Cabang dari identitas_organisasi.
+    Nama kolom HMHI bisa bervariasi; coba beberapa kemungkinan.
     """
     try_cols = ["hmhi_cabang", '"HMHI Cabang"', '"HMHI_cabang"', "HMHI_cabang", "HMHI_CABANG"]
 
@@ -139,7 +157,6 @@ def read_joined_df():
         order_expr = "hmhi_cabang"
     else:
         hmhi_select = f"{hmhi_col_expr} AS hmhi_cabang"
-        # untuk ORDER BY, gunakan alias yang sama setelah SELECT agar portable
         order_expr = "hmhi_cabang"
 
     sql = f"""
@@ -163,8 +180,8 @@ def read_joined_df():
         df = fetch_df(sql)
     except Exception:
         # SQLite tidak dukung "NULLS LAST"
-        sql_sqlite = sql.replace(" NULLS LAST", "")
-        df = fetch_df(sql_sqlite)
+        sql = sql.replace(" NULLS LAST", "")
+        df = fetch_df(sql)
 
     view_df = df.copy()
     if "hmhi_cabang" in view_df.columns:
@@ -186,13 +203,14 @@ def read_joined_df():
     view_df = view_df[cols_order] if cols_order else view_df
     return df, view_df
 
+
 # ---------- UI ----------
 with st.expander("ℹ️ Keterangan", expanded=True):
     st.markdown("""
-- **Rebuild Rekap** akan mengosongkan tabel gabungan dan mengisinya ulang dari tabel sumber **kelompok_usia**.
-- Konflik primary key `id` dihindari karena **tidak menyalin `id`** dari sumber.
+- Tombol **Rebuild Rekap** akan mengosongkan tabel gabungan dan mengisinya ulang dari **kelompok_usia**.
+- Aman di Postgres meski tabel lama belum punya sequence: halaman ini akan **memperbaiki default `id`** jika diperlukan.
 - Tampilan sudah **join HMHI Cabang** dari `identitas_organisasi`.
-- Bisa **unduh Excel** hasil rekap.
+- Sediakan **unduh Excel** hasil rekap.
 """)
 
 c1, c2 = st.columns([1, 3])
