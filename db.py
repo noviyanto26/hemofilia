@@ -172,12 +172,17 @@ def ping() -> dict:
         return {"ok": False, "url": safe_url(get_database_url()), "error": repr(e)}
 
 def exec_sql(sql: str, params: dict | None = None):
-    """Eksekusi SQL (DDL/DML) dengan optional params, return result proxy."""
-    with connect_ctx() as conn:
+    """
+    Eksekusi SQL (DDL/DML) dengan optional params, auto-commit.
+    Menggunakan transaction context (engine.begin()) agar TRUNCATE/CREATE/INSERT
+    dan kawan-kawan benar-benar tersimpan.
+    """
+    eng = get_engine()
+    with eng.begin() as conn:  # <- penting: auto-commit di akhir block
         return conn.execute(text(sql), params or {})
 
 def read_sql_df(sql: str, params: dict | None = None) -> pd.DataFrame:
-    """Baca hasil query ke DataFrame (aman & dengan logging error ringkas)."""
+    """Baca hasil query ke DataFrame (aman & logging ringkas jika error)."""
     try:
         with connect_ctx() as conn:
             return pd.read_sql_query(text(sql), conn, params=params or {})
@@ -191,8 +196,17 @@ def read_sql_df(sql: str, params: dict | None = None) -> pd.DataFrame:
         print("DB ERROR:", json.dumps(info, ensure_ascii=False), file=sys.stderr)
         raise
 
+# --- Tambahan: alias nyaman agar kompatibel dengan halaman lain ---
+def fetch_df(sql: str, params: dict | None = None) -> pd.DataFrame:
+    """
+    Alias untuk read_sql_df(), sesuai kebutuhan halaman:
+    from db import get_engine, exec_sql, fetch_df
+    """
+    return read_sql_df(sql, params=params)
+
 def table_exists(table_name: str) -> bool:
     """Cek keberadaan tabel yang kompatibel untuk Postgres/SQLite."""
+    # Coba cara Postgres (to_regclass)
     try:
         with connect_ctx() as conn:
             res = conn.execute(
@@ -200,12 +214,32 @@ def table_exists(table_name: str) -> bool:
                 {"t": table_name},
             )
             row = res.fetchone()
-            return bool(row[0]) if row else False
+            if row is not None:
+                return bool(row[0])
     except Exception:
-        # Fallback generic (works for SQLite & PG)
-        try:
-            with connect_ctx() as conn:
-                _ = conn.execute(text("SELECT 1 FROM " + table_name + " LIMIT 1")).fetchone()
-                return True
-        except Exception:
-            return False
+        pass
+
+    # Fallback generic (SQLite & juga PG)
+    try:
+        with connect_ctx() as conn:
+            _ = conn.execute(text(f"SELECT 1 FROM {table_name} LIMIT 1"))
+            return True
+    except Exception:
+        return False
+
+# ---------------------------------------------------------------------
+# (Opsional) Dialect helpers yang berguna untuk kode halaman
+# ---------------------------------------------------------------------
+def is_postgres() -> bool:
+    try:
+        eng = get_engine()
+        return (eng.dialect.name or "").lower() in ("postgresql", "postgres")
+    except Exception:
+        return False
+
+def is_sqlite() -> bool:
+    try:
+        eng = get_engine()
+        return (eng.dialect.name or "").lower() == "sqlite"
+    except Exception:
+        return False
