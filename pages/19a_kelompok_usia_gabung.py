@@ -302,14 +302,16 @@ with tab2:
         # Rasio A:B per kelompok usia
         if {"hemo_a", "hemo_b"}.issubset(usia_df.columns):
             ratio_df = usia_df[["hemo_a", "hemo_b"]].copy()
-            ratio_df["A:B Ratio"] = ratio_df.apply(
-                lambda r: (r["hemo_a"] / r["hemo_b"]) if r["hemo_b"] > 0 else (r["hemo_a"] if r["hemo_a"] > 0 else 0),
-                axis=1,
-            )
-            st.write("**Rasio A:B per Kelompok Usia** (jika B=0, ditampilkan nilai A sebagai indikasi):")
-            st.bar_chart(ratio_df[["A:B Ratio"]], use_container_width=True)
+            # Hindari pembagian nol; gunakan NaN lalu isi 0 agar float
+            ratio_df["A_B_Ratio"] = (ratio_df["hemo_a"] / ratio_df["hemo_b"]).replace([float("inf")], float("nan"))
+            ratio_df["A_B_Ratio"] = ratio_df["A_B_Ratio"].fillna(0.0)
+
+            st.write("**Rasio A vs B per Kelompok Usia** (0 jika B=0):")
+            st.bar_chart(ratio_df[["A_B_Ratio"]], use_container_width=True)
     else:
         st.info("Kolom 'kelompok_usia' tidak ditemukan.")
+
+
 
 with tab3:
     st.subheader("Agregasi per HMHI Cabang")
