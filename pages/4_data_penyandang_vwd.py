@@ -13,7 +13,19 @@ IDENTITAS_TABLE = "public.identitas_organisasi"
 
 # Konektor ke Postgres (via db.py)
 # Harus tersedia fungsi: fetch_df(sql, params=None), execute(sql, params=None), run_ddl(ddl)
-from db import fetch_df as pg_fetch_df, execute as pg_execute, run_ddl
+# Kompatibilitas: beberapa repo memakai exec_sql, bukan execute
+try:
+    from db import fetch_df as pg_fetch_df, execute as pg_execute, run_ddl
+except ImportError:
+    from db import fetch_df as pg_fetch_df, exec_sql as pg_execute
+    # Fallback run_ddl jika tidak ada di db.py
+    try:
+        from db import run_ddl
+    except Exception:
+        def run_ddl(ddl: str):
+            for stmt in [s.strip() for s in ddl.split(";") if s.strip()]:
+                pg_execute(stmt)
+
 
 # ===== Konstanta UI/Data =====
 AGE_GROUPS = ["0-4", "5-13", "14-18", "19-44", ">45", "Tidak ada data usia"]
