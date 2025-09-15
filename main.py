@@ -1,4 +1,12 @@
 # main.py
+# debug di awal app:
+from db import ping
+import streamlit as st
+info = ping()
+st.write("DB Ping:", info)  # harus menampilkan {"ok": True/False, "url": "..."}
+
+
+
 import streamlit as st
 import runpy
 from pathlib import Path
