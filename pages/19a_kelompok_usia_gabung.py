@@ -58,42 +58,55 @@ def ensure_dst_table():
 def _pg_fix_id_default_if_needed():
     """
     Perbaiki default sequence kolom id jika tabel lama dibuat tanpa BIGSERIAL/IDENTITY.
-    Aman dijalankan berkali-kali (idempotent).
+    Aman dijalankan berkali-kali (idempotent), dan sinkronkan sequence
+    TANPA pernah set ke 0 (pakai 1,false saat tabel kosong).
     """
     if not is_postgres():
         return
 
-    q = """
-    SELECT column_default
-    FROM information_schema.columns
-    WHERE table_schema = 'public' AND table_name = 'kelompok_usia_gabung' AND column_name = 'id'
-    """
-    try:
-        df = fetch_df(q)
-        col_default = (df.iloc[0, 0] if not df.empty else None)
-    except Exception:
-        col_default = None
+    # 1) Pastikan default sequence terpasang
+    exec_sql("""
+    DO $$
+    DECLARE
+      col_default text;
+      has_seq boolean;
+    BEGIN
+      SELECT column_default INTO col_default
+      FROM information_schema.columns
+      WHERE table_schema='public' AND table_name='kelompok_usia_gabung' AND column_name='id';
 
-    if not col_default:
-        exec_sql("""
-        DO $$
-        DECLARE
-          has_seq boolean;
-        BEGIN
-          SELECT EXISTS (
-            SELECT 1 FROM pg_class c
-            WHERE c.relkind = 'S' AND c.relname = 'kelompok_usia_gabung_id_seq'
-          ) INTO has_seq;
+      IF col_default IS NULL THEN
+        SELECT EXISTS (
+          SELECT 1 FROM pg_class c WHERE c.relkind='S' AND c.relname='kelompok_usia_gabung_id_seq'
+        ) INTO has_seq;
 
-          IF NOT has_seq THEN
-            EXECUTE 'CREATE SEQUENCE public.kelompok_usia_gabung_id_seq AS BIGINT START WITH 1 INCREMENT BY 1';
-          END IF;
+        IF NOT has_seq THEN
+          EXECUTE 'CREATE SEQUENCE public.kelompok_usia_gabung_id_seq AS BIGINT START WITH 1 INCREMENT BY 1';
+        END IF;
 
-          EXECUTE 'ALTER SEQUENCE public.kelompok_usia_gabung_id_seq OWNED BY public.kelompok_usia_gabung.id';
-          EXECUTE 'ALTER TABLE public.kelompok_usia_gabung ALTER COLUMN id SET DEFAULT nextval(''public.kelompok_usia_gabung_id_seq'')';
-          EXECUTE 'SELECT setval(''public.kelompok_usia_gabung_id_seq'', COALESCE((SELECT MAX(id) FROM public.kelompok_usia_gabung), 0))';
-        END $$;
-        """)
+        EXECUTE 'ALTER SEQUENCE public.kelompok_usia_gabung_id_seq OWNED BY public.kelompok_usia_gabung.id';
+        EXECUTE 'ALTER TABLE public.kelompok_usia_gabung ALTER COLUMN id SET DEFAULT nextval(''public.kelompok_usia_gabung_id_seq'')';
+      END IF;
+    END $$;
+    """)
+
+    # 2) Sinkronkan nilai sequence dengan isi tabel (tanpa set 0)
+    exec_sql("""
+    DO $$
+    DECLARE
+      max_id BIGINT;
+      row_count BIGINT;
+    BEGIN
+      SELECT COUNT(*), COALESCE(MAX(id), 0) INTO row_count, max_id
+      FROM public.kelompok_usia_gabung;
+
+      IF row_count = 0 THEN
+        PERFORM setval('public.kelompok_usia_gabung_id_seq', 1, false);
+      ELSE
+        PERFORM setval('public.kelompok_usia_gabung_id_seq', max_id, true);
+      END IF;
+    END $$;
+    """)
 
 
 # ---------- REBUILD: truncate + insert (tanpa kolom id) ----------
@@ -232,6 +245,115 @@ raw_df, view_df = read_joined_df()
 st.subheader("📊 Rekap Gabungan (Tampilan)")
 st.dataframe(view_df, use_container_width=True, hide_index=True)
 
+# ==================== ANALISIS & GRAFIK ====================
+st.divider()
+st.header("📈 Analisis Rekapitulasi & Grafik")
+
+# --- Siapkan data agregasi numeric ---
+num_cols = ["hemo_a", "hemo_b", "hemo_tipe_lain", "vwd_tipe1", "vwd_tipe2"]
+df_num = raw_df.copy()
+for c in num_cols:
+    if c in df_num.columns:
+        df_num[c] = pd.to_numeric(df_num[c], errors="coerce").fillna(0).astype(int)
+
+# --- KPI Ringkas ---
+total_a = int(df_num["hemo_a"].sum()) if "hemo_a" in df_num else 0
+total_b = int(df_num["hemo_b"].sum()) if "hemo_b" in df_num else 0
+total_hemo = total_a + total_b
+total_lain = int(df_num["hemo_tipe_lain"].sum()) if "hemo_tipe_lain" in df_num else 0
+total_vwd1 = int(df_num["vwd_tipe1"].sum()) if "vwd_tipe1" in df_num else 0
+total_vwd2 = int(df_num["vwd_tipe2"].sum()) if "vwd_tipe2" in df_num else 0
+grand_total = total_hemo + total_lain + total_vwd1 + total_vwd2
+
+cKPI1, cKPI2, cKPI3, cKPI4 = st.columns(4)
+cKPI1.metric("Hemofilia A (total)", f"{total_a:,}")
+cKPI2.metric("Hemofilia B (total)", f"{total_b:,}")
+cKPI3.metric("vWD (total)", f"{(total_vwd1 + total_vwd2):,}")
+cKPI4.metric("Grand Total", f"{grand_total:,}")
+
+# --- Tabs Analitik ---
+tab1, tab2, tab3, tab4 = st.tabs(["Ringkasan", "Per Kelompok Usia", "Per HMHI Cabang", "Tren Waktu"])
+
+with tab1:
+    st.subheader("Distribusi Total per Kategori")
+    total_df = pd.DataFrame({
+        "Kategori": ["Hemofilia A", "Hemofilia B", "Hemofilia Tipe Lain", "vWD - Tipe 1", "vWD - Tipe 2"],
+        "Jumlah": [total_a, total_b, total_lain, total_vwd1, total_vwd2],
+    }).set_index("Kategori")
+    st.bar_chart(total_df, use_container_width=True)
+
+    if total_hemo > 0:
+        ratio_ab = (total_a / total_hemo) if total_hemo else 0
+        st.write(f"**Rasio Hemofilia A:B** → A = {total_a:,}, B = {total_b:,} (A menyumbang {ratio_ab:.1%} dari total Hemofilia A+B).")
+    else:
+        st.write("Belum ada data Hemofilia A+B untuk menghitung rasio.")
+
+with tab2:
+    st.subheader("Agregasi per Kelompok Usia")
+    if "kelompok_usia" in df_num.columns:
+        usia_df = (
+            df_num.groupby("kelompok_usia", dropna=False)[num_cols]
+            .sum()
+            .sort_index()
+        )
+        st.dataframe(usia_df, use_container_width=True)
+        st.bar_chart(usia_df, use_container_width=True)
+
+        # Rasio A:B per kelompok usia
+        if {"hemo_a", "hemo_b"}.issubset(usia_df.columns):
+            ratio_df = usia_df[["hemo_a", "hemo_b"]].copy()
+            ratio_df["A:B Ratio"] = ratio_df.apply(
+                lambda r: (r["hemo_a"] / r["hemo_b"]) if r["hemo_b"] > 0 else (r["hemo_a"] if r["hemo_a"] > 0 else 0),
+                axis=1,
+            )
+            st.write("**Rasio A:B per Kelompok Usia** (jika B=0, ditampilkan nilai A sebagai indikasi):")
+            st.bar_chart(ratio_df[["A:B Ratio"]], use_container_width=True)
+    else:
+        st.info("Kolom 'kelompok_usia' tidak ditemukan.")
+
+with tab3:
+    st.subheader("Agregasi per HMHI Cabang")
+    df_cabang = raw_df.copy()
+    # Ambil label cabang dari view_df (yang sudah dialias)
+    if "HMHI Cabang" in view_df.columns:
+        # gabungkan id baris untuk memastikan urutan sinkron jika diperlukan
+        df_cabang = df_cabang.join(view_df["HMHI Cabang"])
+    else:
+        df_cabang["HMHI Cabang"] = None
+
+    df_cabang["HMHI Cabang"] = df_cabang["HMHI Cabang"].fillna("— (Tidak terisi)")
+    cabang_df = (
+        df_cabang.groupby("HMHI Cabang", dropna=False)[num_cols]
+        .sum()
+        .sort_values(["hemo_a", "hemo_b", "hemo_tipe_lain", "vwd_tipe1", "vwd_tipe2"], ascending=False)
+    )
+    st.dataframe(cabang_df, use_container_width=True)
+    st.bar_chart(cabang_df[["hemo_a", "hemo_b"]], use_container_width=True)
+
+    # Top 10 Cabang berdasarkan Hemofilia (A+B)
+    if {"hemo_a", "hemo_b"}.issubset(cabang_df.columns):
+        cabang_df["total_hemo"] = cabang_df["hemo_a"] + cabang_df["hemo_b"]
+        top10 = cabang_df.sort_values("total_hemo", ascending=False).head(10)
+        st.write("**Top 10 HMHI Cabang berdasarkan total Hemofilia (A+B):**")
+        st.dataframe(top10[["total_hemo", "hemo_a", "hemo_b"]], use_container_width=True)
+
+with tab4:
+    st.subheader("Tren Waktu (berdasarkan created_at)")
+    if "created_at" in df_num.columns:
+        # Normalisasi ke tanggal (hari)
+        ts = df_num.copy()
+        ts["created_at"] = pd.to_datetime(ts["created_at"], errors="coerce").dt.date
+        ts = ts.dropna(subset=["created_at"])
+        if not ts.empty:
+            daily = ts.groupby("created_at")[num_cols].sum().sort_index()
+            st.line_chart(daily, use_container_width=True)
+        else:
+            st.info("Tidak ada data tanggal yang valid untuk dianalisis.")
+    else:
+        st.info("Kolom 'created_at' tidak ditemukan.")
+
+# ==================== Unduh Excel ====================
+st.divider()
 st.subheader("⬇️ Unduh Rekap (Excel)")
 with io.BytesIO() as buffer:
     with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
