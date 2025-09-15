@@ -1,10 +1,9 @@
-# 19b_rekap_jumlah_individu.py — Postgres-ready via db.py (fallback SQLite)
+# 19b_rekap_jumlah_individu.py — Postgres-ready via db.py (adaptive backend)
 import streamlit as st
 import pandas as pd
 import io
 
-from db import read_sql_df, ping
-IS_PG = (ping() == "postgresql")
+from db import read_sql_df
 
 # ============== Konfigurasi Halaman ==============
 st.set_page_config(page_title="Rekap Jumlah Individu Hemofilia", page_icon="📊", layout="wide")
@@ -24,18 +23,29 @@ DB_COLS = [c for c, _ in FIELDS]
 ALIAS_MAP = {c: a for c, a in FIELDS}
 
 # ============== Helpers DB ==============
+
 def table_exists(table: str) -> bool:
-    if IS_PG:
+    """Deteksi adaptif: coba cek di Postgres (information_schema) lalu fallback ke SQLite."""
+    # Coba Postgres (schema public)
+    try:
         df = read_sql_df(
             """
-            SELECT 1 FROM information_schema.tables
-            WHERE table_schema NOT IN ('pg_catalog','information_schema') AND table_name = :t
-            """, {"t": table}
+            SELECT 1
+            FROM information_schema.tables
+            WHERE table_schema IN ('public') AND table_name = :t
+            LIMIT 1
+            """,
+            {"t": table},
         )
         return not df.empty
-    else:
-        df = read_sql_df("SELECT name FROM sqlite_master WHERE type='table' AND name=:t", {"t": table})
-        return not df.empty
+    except Exception:
+        # Fallback SQLite
+        try:
+            df = read_sql_df("SELECT name FROM sqlite_master WHERE type='table' AND name=:t", {"t": table})
+            return not df.empty
+        except Exception:
+            return False
+
 
 def load_raw() -> pd.DataFrame:
     """Ambil semua data dari jumlah_individu_hemofilia JOIN identitas_organisasi."""
@@ -49,14 +59,32 @@ def load_raw() -> pd.DataFrame:
           io.hmhi_cabang,
           io.kota_cakupan_cabang,
           {", ".join([f"j.{c}" for c in DB_COLS])}
-        FROM {TABLE} j
-        LEFT JOIN identitas_organisasi io ON io.kode_organisasi = j.kode_organisasi
+        FROM public.{TABLE} j
+        LEFT JOIN public.identitas_organisasi io ON io.kode_organisasi = j.kode_organisasi
         ORDER BY j.created_at DESC
     """
-    df = read_sql_df(base_sql)
+    try:
+        df = read_sql_df(base_sql)
+    except Exception:
+        # Fallback tanpa schema qualifier (mis. SQLite / search_path custom)
+        df = read_sql_df(
+            f"""
+            SELECT
+              j.created_at,
+              j.kode_organisasi,
+              io.hmhi_cabang,
+              io.kota_cakupan_cabang,
+              {", ".join([f"j.{c}" for c in DB_COLS])}
+            FROM {TABLE} j
+            LEFT JOIN identitas_organisasi io ON io.kode_organisasi = j.kode_organisasi
+            ORDER BY j.created_at DESC
+            """
+        )
+
     for c in DB_COLS:
         df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).clip(lower=0).astype(int)
     return df
+
 
 def alias_df(df: pd.DataFrame) -> pd.DataFrame:
     return df.rename(columns=ALIAS_MAP).rename(columns={
