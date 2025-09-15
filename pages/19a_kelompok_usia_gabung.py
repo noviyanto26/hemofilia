@@ -58,13 +58,12 @@ def ensure_dst_table():
 def _pg_fix_id_default_if_needed():
     """
     Perbaiki default sequence kolom id jika tabel lama dibuat tanpa BIGSERIAL/IDENTITY.
-    Aman dijalankan berkali-kali (idempotent), dan sinkronkan sequence
-    TANPA pernah set ke 0 (pakai 1,false saat tabel kosong).
+    Idempotent dan sinkronkan sequence TANPA set 0 (pakai 1,false saat tabel kosong).
     """
     if not is_postgres():
         return
 
-    # 1) Pastikan default sequence terpasang
+    # 1) Pastikan default terpasang
     exec_sql("""
     DO $$
     DECLARE
@@ -90,7 +89,7 @@ def _pg_fix_id_default_if_needed():
     END $$;
     """)
 
-    # 2) Sinkronkan nilai sequence dengan isi tabel (tanpa set 0)
+    # 2) Sinkronkan dengan isi tabel
     exec_sql("""
     DO $$
     DECLARE
@@ -128,7 +127,7 @@ def rebuild_gabungan():
         try:
             exec_sql(f"DELETE FROM sqlite_sequence WHERE name = '{DST_TABLE}';")
         except Exception:
-            pass  # sqlite_sequence bisa belum ada
+            pass
 
     exec_sql(f"""
         INSERT INTO {DST_TABLE} (
@@ -159,7 +158,7 @@ def read_joined_df():
     hmhi_col_expr = None
     for c in try_cols:
         try:
-            _ = fetch_df(f"SELECT {c} FROM {ORG_TABLE} LIMIT 0;")  # uji keberadaan kolom
+            _ = fetch_df(f"SELECT {c} FROM {ORG_TABLE} LIMIT 0;")  # uji kolom
             hmhi_col_expr = c
             break
         except Exception:
@@ -192,7 +191,7 @@ def read_joined_df():
     try:
         df = fetch_df(sql)
     except Exception:
-        # SQLite tidak dukung "NULLS LAST"
+        # SQLite tidak dukung NULLS LAST
         sql = sql.replace(" NULLS LAST", "")
         df = fetch_df(sql)
 
@@ -220,12 +219,11 @@ def read_joined_df():
 # ---------- UI ----------
 with st.expander("ℹ️ Keterangan", expanded=True):
     st.markdown("""
-- Tombol **Rebuild Rekap** akan mengosongkan tabel gabungan dan mengisinya ulang dari **kelompok_usia**.
-- Aman di Postgres meski tabel lama belum punya sequence: halaman ini akan **memperbaiki default `id`** jika diperlukan.
-- Tampilan sudah **join HMHI Cabang** dari `identitas_organisasi`.
-- Sediakan **unduh Excel** hasil rekap.
+Tombol **Rebuild Rekap** mengosongkan tabel gabungan dan mengisi ulang dari **kelompok_usia**.
+Halaman ini juga menampilkan analisis & grafik rekapitulasi.
 """)
 
+# Tombol Rebuild tetap ADA
 c1, c2 = st.columns([1, 3])
 with c1:
     if st.button("🔨 Rebuild Rekap", type="primary", use_container_width=True):
@@ -245,18 +243,16 @@ raw_df, view_df = read_joined_df()
 st.subheader("📊 Rekap Gabungan (Tampilan)")
 st.dataframe(view_df, use_container_width=True, hide_index=True)
 
-# ==================== ANALISIS & GRAFIK ====================
+# ==================== ANALISIS & GRAFIK (tanpa tab Tren Waktu) ====================
 st.divider()
 st.header("📈 Analisis Rekapitulasi & Grafik")
 
-# --- Siapkan data agregasi numeric ---
 num_cols = ["hemo_a", "hemo_b", "hemo_tipe_lain", "vwd_tipe1", "vwd_tipe2"]
 df_num = raw_df.copy()
 for c in num_cols:
     if c in df_num.columns:
         df_num[c] = pd.to_numeric(df_num[c], errors="coerce").fillna(0).astype(int)
 
-# --- KPI Ringkas ---
 total_a = int(df_num["hemo_a"].sum()) if "hemo_a" in df_num else 0
 total_b = int(df_num["hemo_b"].sum()) if "hemo_b" in df_num else 0
 total_hemo = total_a + total_b
@@ -271,8 +267,8 @@ cKPI2.metric("Hemofilia B (total)", f"{total_b:,}")
 cKPI3.metric("vWD (total)", f"{(total_vwd1 + total_vwd2):,}")
 cKPI4.metric("Grand Total", f"{grand_total:,}")
 
-# --- Tabs Analitik ---
-tab1, tab2, tab3, tab4 = st.tabs(["Ringkasan", "Per Kelompok Usia", "Per HMHI Cabang", "Tren Waktu"])
+# --- Tabs Analitik (3 tab saja) ---
+tab1, tab2, tab3 = st.tabs(["Ringkasan", "Per Kelompok Usia", "Per HMHI Cabang"])
 
 with tab1:
     st.subheader("Distribusi Total per Kategori")
@@ -283,10 +279,10 @@ with tab1:
     st.bar_chart(total_df, use_container_width=True)
 
     if total_hemo > 0:
-        ratio_ab = (total_a / total_hemo) if total_hemo else 0
-        st.write(f"**Rasio Hemofilia A:B** → A = {total_a:,}, B = {total_b:,} (A menyumbang {ratio_ab:.1%} dari total Hemofilia A+B).")
+        ratio_ab = (total_a / total_hemo)
+        st.write(f"**Rasio Hemofilia A:B** → A = {total_a:,}, B = {total_b:,} (A menyumbang {ratio_ab:.1%} dari total A+B).")
     else:
-        st.write("Belum ada data Hemofilia A+B untuk menghitung rasio.")
+        st.write("Belum ada data Hemofilia A+B.")
 
 with tab2:
     st.subheader("Agregasi per Kelompok Usia")
@@ -299,26 +295,19 @@ with tab2:
         st.dataframe(usia_df, use_container_width=True)
         st.bar_chart(usia_df, use_container_width=True)
 
-        # Rasio A:B per kelompok usia
         if {"hemo_a", "hemo_b"}.issubset(usia_df.columns):
             ratio_df = usia_df[["hemo_a", "hemo_b"]].copy()
-            # Hindari pembagian nol; gunakan NaN lalu isi 0 agar float
             ratio_df["A_B_Ratio"] = (ratio_df["hemo_a"] / ratio_df["hemo_b"]).replace([float("inf")], float("nan"))
             ratio_df["A_B_Ratio"] = ratio_df["A_B_Ratio"].fillna(0.0)
-
             st.write("**Rasio A vs B per Kelompok Usia** (0 jika B=0):")
             st.bar_chart(ratio_df[["A_B_Ratio"]], use_container_width=True)
     else:
         st.info("Kolom 'kelompok_usia' tidak ditemukan.")
 
-
-
 with tab3:
     st.subheader("Agregasi per HMHI Cabang")
     df_cabang = raw_df.copy()
-    # Ambil label cabang dari view_df (yang sudah dialias)
     if "HMHI Cabang" in view_df.columns:
-        # gabungkan id baris untuk memastikan urutan sinkron jika diperlukan
         df_cabang = df_cabang.join(view_df["HMHI Cabang"])
     else:
         df_cabang["HMHI Cabang"] = None
@@ -327,32 +316,16 @@ with tab3:
     cabang_df = (
         df_cabang.groupby("HMHI Cabang", dropna=False)[num_cols]
         .sum()
-        .sort_values(["hemo_a", "hemo_b", "hemo_tipe_lain", "vwd_tipe1", "vwd_tipe2"], ascending=False)
+        .sort_values(["hemo_a", "hemo_b"], ascending=False)
     )
     st.dataframe(cabang_df, use_container_width=True)
     st.bar_chart(cabang_df[["hemo_a", "hemo_b"]], use_container_width=True)
 
-    # Top 10 Cabang berdasarkan Hemofilia (A+B)
     if {"hemo_a", "hemo_b"}.issubset(cabang_df.columns):
         cabang_df["total_hemo"] = cabang_df["hemo_a"] + cabang_df["hemo_b"]
         top10 = cabang_df.sort_values("total_hemo", ascending=False).head(10)
-        st.write("**Top 10 HMHI Cabang berdasarkan total Hemofilia (A+B):**")
+        st.write("**Top 10 HMHI Cabang (Hemofilia A+B):**")
         st.dataframe(top10[["total_hemo", "hemo_a", "hemo_b"]], use_container_width=True)
-
-with tab4:
-    st.subheader("Tren Waktu (berdasarkan created_at)")
-    if "created_at" in df_num.columns:
-        # Normalisasi ke tanggal (hari)
-        ts = df_num.copy()
-        ts["created_at"] = pd.to_datetime(ts["created_at"], errors="coerce").dt.date
-        ts = ts.dropna(subset=["created_at"])
-        if not ts.empty:
-            daily = ts.groupby("created_at")[num_cols].sum().sort_index()
-            st.line_chart(daily, use_container_width=True)
-        else:
-            st.info("Tidak ada data tanggal yang valid untuk dianalisis.")
-    else:
-        st.info("Kolom 'created_at' tidak ditemukan.")
 
 # ==================== Unduh Excel ====================
 st.divider()
