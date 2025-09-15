@@ -1,8 +1,6 @@
-# 19_rekap_hemofilia.py
-import os
+# 19_rekap_hemofilia.py — Postgres/Supabase rework
 import io
 import re
-import sqlite3
 from pathlib import Path
 
 import pandas as pd
@@ -11,76 +9,70 @@ import streamlit as st
 st.set_page_config(page_title="Rekapitulasi Hemofilia", page_icon="📄", layout="wide")
 st.title("📄 Rekapitulasi Data Hemofilia — Multi-sheet Excel")
 
-# ======================== Lokasi DB ========================
-PAGES_DIR = Path(__file__).resolve().parent
-BASE_DIR = PAGES_DIR.parent
-
-DB_PATH_MAIN = BASE_DIR / "hemofilia.db"
-DB_PATH_PAGES = PAGES_DIR / "hemofilia.db"
-
-if DB_PATH_MAIN.exists():
-    DB_PATH = str(DB_PATH_MAIN.resolve())
-elif DB_PATH_PAGES.exists():
-    DB_PATH = str(DB_PATH_PAGES.resolve())
-else:
-    DB_PATH = str(DB_PATH_MAIN.resolve())
-    st.error(
-        "Database tidak ditemukan di kedua lokasi:\n"
-        f"- {DB_PATH_MAIN}\n"
-        f"- {DB_PATH_PAGES}\n\n"
-        "Pastikan file hemofilia.db berada di salah satu lokasi di atas."
-    )
-    st.stop()
-
+# ======================== Konektor DB (via db.py) ========================
+# Kompatibilitas: sebagian repo memakai exec_sql, bukan execute
 try:
-    size = os.path.getsize(DB_PATH)
-    st.caption(f"📁 Database aktif: `{DB_PATH}` • ukuran: {size} byte")
-except FileNotFoundError:
-    st.error(f"Database tidak ditemukan di: {DB_PATH}")
-    st.stop()
+    from db import fetch_df as pg_fetch_df, execute as pg_execute
+except ImportError:
+    from db import fetch_df as pg_fetch_df, exec_sql as pg_execute  # type: ignore
 
-# ======================== Util DB ========================
-def connect():
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("PRAGMA foreign_keys=ON")
-    return conn
+# ======================== Util schema ========================
+PUBLIC_SCHEMA = "public"
+IDENTITAS_TABLE = f"{PUBLIC_SCHEMA}.identitas_organisasi"
 
-def list_tables():
-    with connect() as conn:
-        q = "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
-        return [r[0] for r in conn.execute(q).fetchall()]
 
-def read_table(table: str) -> pd.DataFrame:
-    with connect() as conn:
-        try:
-            return pd.read_sql_query(f"SELECT * FROM {table}", conn)
-        except Exception:
-            return pd.DataFrame()
+def list_tables() -> list[str]:
+    """Ambil daftar tabel di schema public (kecuali internal backup/new)."""
+    df = pg_fetch_df(
+        """
+        SELECT tablename
+        FROM pg_catalog.pg_tables
+        WHERE schemaname = :schema
+          AND tablename NOT LIKE '%_backup'
+          AND tablename NOT LIKE '%_new'
+          AND tablename NOT LIKE 'pg_%'
+          AND tablename NOT LIKE 'sql_%'
+        ORDER BY tablename
+        """,
+        {"schema": PUBLIC_SCHEMA},
+    )
+    return df["tablename"].astype(str).tolist() if not df.empty else []
+
+
+def read_table_public(table: str) -> pd.DataFrame:
+    """SELECT * FROM public.<table>. Identifier disanitasi dengan whitelist dari list_tables()."""
+    valid = set(list_tables())
+    if table not in valid:
+        return pd.DataFrame()
+    sql = f'SELECT * FROM "{PUBLIC_SCHEMA}"."{table}"'  # quote identifier aman
+    return pg_fetch_df(sql)
+
 
 def read_identitas_for_join() -> pd.DataFrame:
     """Ambil kolom kunci dari identitas_organisasi untuk keperluan join/alias."""
-    df = read_table("identitas_organisasi")
-    if df.empty:
+    try:
+        df = pg_fetch_df(
+            f"""
+            SELECT kode_organisasi, hmhi_cabang, kota_cakupan_cabang
+            FROM {IDENTITAS_TABLE}
+            """
+        )
+    except Exception:
         return pd.DataFrame()
-    if "kode_organisasi" not in df.columns:
+
+    if df.empty or "kode_organisasi" not in df.columns:
         return pd.DataFrame()
-    df = df.copy()
-    df["kode_organisasi"] = df["kode_organisasi"].astype(str)
 
-    # Pastikan kolom yang sering dipakai tersedia
-    for col in ["hmhi_cabang", "kota_cakupan_cabang"]:
-        if col not in df.columns:
-            df[col] = None
+    d = df.copy()
+    d["kode_organisasi"] = d["kode_organisasi"].astype(str)
+    d["Propinsi"] = d.get("kota_cakupan_cabang", pd.Series(dtype=str)).astype(str)
+    return d[["kode_organisasi", "hmhi_cabang", "kota_cakupan_cabang", "Propinsi"]].drop_duplicates()
 
-    # Propinsi dipetakan dari kota_cakupan_cabang
-    df["Propinsi"] = df["kota_cakupan_cabang"].astype(str)
-    return df[["kode_organisasi", "hmhi_cabang", "kota_cakupan_cabang", "Propinsi"]].drop_duplicates()
 
 DF_IO = read_identitas_for_join()
 HAS_IO = not DF_IO.empty
 
 # ======================== Alias: nama sheet per tabel ========================
-# <<< BAGIAN INI TELAH DIUBAH >>>
 TABLE_ALIASES = {
     "identitas_organisasi": "Identitas Organisasi",
     "jumlah_individu_hemofilia": "Jumlah Individu dengan Hemofilia",
@@ -100,7 +92,6 @@ TABLE_ALIASES = {
     "vwd_berat_jumlah": "Jumlah Penyandang VWD Berat (Tipe 3)",
     "vwd_usia_gender": "Data Penyandang von Willebrand Disease (vWD) — per Kelompok Usia & Jenis Kelamin",
 }
-
 
 # ======================== Filter kandidat tabel (opsional) ========================
 module_files = [
@@ -124,11 +115,13 @@ module_files = [
     "18_kematian_hemofilia_2024_sekarang.py",
 ]
 
+
 def file_to_keywords(fname: str) -> list[str]:
     base = Path(fname).stem
     base = re.sub(r"^\d+_", "", base)
     tokens = re.split(r"[^a-zA-Z0-9]+", base)
     return [t for t in tokens if t]
+
 
 flat_keywords = set()
 for f in module_files:
@@ -139,17 +132,18 @@ for f in module_files:
     if joined:
         flat_keywords.add(joined)
 
-existing_tables = [t for t in list_tables() if not (t.endswith("_backup") or t.endswith("_new"))]
-st.caption(f"📋 Tabel terdeteksi: {len(existing_tables)}")
+existing_tables = list_tables()
+st.caption(f"📋 Tabel terdeteksi (schema public): {len(existing_tables)}")
+
 
 def matches_module_keywords(tname: str) -> bool:
     lname = tname.lower()
     return any(k in lname for k in flat_keywords)
 
-# <<< BAGIAN INI TELAH DIUBAH >>>
+
 candidates_from_keywords = [t for t in existing_tables if matches_module_keywords(t)]
 candidates = candidates_from_keywords if candidates_from_keywords else existing_tables
-# Sembunyikan tabel tingkat_hemofilia_jk dari pilihan default
+# Sembunyikan tabel tingkat_hemofilia_jk dari pilihan default (kalau ada)
 tables_default = [t for t in candidates if t != "tingkat_hemofilia_jk"]
 
 
@@ -164,19 +158,22 @@ if not tables_selected:
 # ======================== Per-tabel: proses khusus & alias ========================
 HIDE_COLS_COMMON = {"id", "kode_organisasi", "created_at", "is_total_row"}
 
+
 def join_with_hmhi(df: pd.DataFrame) -> pd.DataFrame:
-    """Fungsi helper untuk join dengan DF_IO dan menambahkan HMHI Cabang."""
+    """Join dengan DF_IO dan menambahkan HMHI Cabang (jika ada)."""
     if df.empty or not HAS_IO or "kode_organisasi" not in df.columns:
         return df
     d = df.copy()
     d["kode_organisasi"] = d["kode_organisasi"].astype(str)
     merged = d.merge(DF_IO[["kode_organisasi", "hmhi_cabang"]], on="kode_organisasi", how="left", suffixes=("", "_io"))
+    # Gunakan nama display konsisten
+    merged.rename(columns={"hmhi_cabang": "HMHI Cabang"}, inplace=True)
     return merged
 
+
 def reorder_cols(df: pd.DataFrame, hide_cols: set) -> pd.DataFrame:
-    """Fungsi helper untuk menyembunyikan kolom dan memindahkan HMHI Cabang ke depan."""
     all_cols = [c for c in df.columns if c not in hide_cols and not c.endswith("_io")]
-    ordered = []
+    ordered: list[str] = []
     if "HMHI Cabang" in all_cols:
         ordered.append("HMHI Cabang")
     for col in all_cols:
@@ -184,38 +181,43 @@ def reorder_cols(df: pd.DataFrame, hide_cols: set) -> pd.DataFrame:
             ordered.append(col)
     return df[ordered]
 
-# --- Existing processing functions ---
+
+# --- Existing processing functions (disesuaikan agar tidak bergantung SQLite) ---
+
 def process_identitas(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty: return df
+    if df.empty:
+        return df
     d = df.copy()
-    if "kota_cakupan_cabang" in d.columns:
-        d["Propinsi"] = d["kota_cakupan_cabang"].astype(str)
-    else:
-        d["Propinsi"] = None
+    d["Propinsi"] = d.get("kota_cakupan_cabang", pd.Series(dtype=str)).astype(str)
     alias_map = {
-        "hmhi_cabang": "HMHI Cabang", "diisi_oleh": "Diisi Oleh", "jabatan": "Jabatan",
-        "no_telp": "No Telp", "email": "Email", "sumber_data": "SumberData",
-        "tanggal": "Tanggal", "catatan": "Catatan",
+        "hmhi_cabang": "HMHI Cabang",
+        "diisi_oleh": "Diisi Oleh",
+        "jabatan": "Jabatan",
+        "no_telp": "No Telp",
+        "email": "Email",
+        "sumber_data": "SumberData",
+        "tanggal": "Tanggal",
+        "catatan": "Catatan",
     }
     d.rename(columns=alias_map, inplace=True)
     cols = [c for c in d.columns if c not in HIDE_COLS_COMMON]
     head_cols = [c for c in ["HMHI Cabang", "Diisi Oleh", "Jabatan"] if c in cols]
-    ordered = []
+    ordered: list[str] = []
     ordered.extend(head_cols)
-    if "Propinsi" in cols: ordered.append("Propinsi")
+    if "Propinsi" in cols:
+        ordered.append("Propinsi")
     for c in cols:
-        if c not in ordered: ordered.append(c)
+        if c not in ordered:
+            ordered.append(c)
     return d[ordered]
 
+
 def process_jumlah_individu(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty: return df
-    d = df.copy()
-    if "kode_organisasi" in d.columns and HAS_IO:
-        left = d.copy()
-        left["kode_organisasi"] = left["kode_organisasi"].astype(str)
-        d = left.merge(DF_IO, on="kode_organisasi", how="left", suffixes=("", "_io"))
+    if df.empty:
+        return df
+    d = join_with_hmhi(df)
     alias_map = {
-        "hmhi_cabang": "HMHI cabang", "Propinsi": "Propinsi",
+        "Propinsi": "Propinsi",
         "jumlah_total_ab": "Jumlah total penyandang hemofilia A dan B",
         "hemofilia_lain": "Hemofilia lain/tidak dikenal",
         "terduga": "Terduga hemofilia/diagnosis belum ditegakkan",
@@ -224,226 +226,334 @@ def process_jumlah_individu(df: pd.DataFrame) -> pd.DataFrame:
     }
     d.rename(columns=alias_map, inplace=True)
     cols = [c for c in d.columns if c not in HIDE_COLS_COMMON]
-    ordered = []
-    for c in ["HMHI cabang", "Propinsi"]:
-        if c in cols: ordered.append(c)
+    ordered: list[str] = []
+    for c in ["HMHI Cabang", "Propinsi"]:
+        if c in cols:
+            ordered.append(c)
     preferred_tail = [
-        "Jumlah total penyandang hemofilia A dan B", "Hemofilia lain/tidak dikenal",
-        "Terduga hemofilia/diagnosis belum ditegakkan", "Von Willebrand Disease (vWD)",
+        "Jumlah total penyandang hemofilia A dan B",
+        "Hemofilia lain/tidak dikenal",
+        "Terduga hemofilia/diagnosis belum ditegakkan",
+        "Von Willebrand Disease (vWD)",
         "Kelainan pembekuan darah genetik lainnya",
     ]
     for c in preferred_tail:
-        if c in cols and c not in ordered: ordered.append(c)
+        if c in cols and c not in ordered:
+            ordered.append(c)
     for c in cols:
-        if c not in ordered: ordered.append(c)
+        if c not in ordered:
+            ordered.append(c)
     return d[ordered]
 
+
 def process_anak_berat(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty: return df
+    if df.empty:
+        return df
     d = df.copy()
-    alias_map = {"kategori": "Kategori", "berat": "Berat (<1%)"}
-    d.rename(columns=alias_map, inplace=True)
+    d.rename(columns={"kategori": "Kategori", "berat": "Berat (<1%)"}, inplace=True)
     hide_extra = {"kode_organisasi", "created_at", "is_total_row"}
     cols = [c for c in d.columns if c not in hide_extra]
     return d[cols]
 
+
 def process_hemo_berat_prophylaxis_usia(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty: return df
+    if df.empty:
+        return df
     d = df.copy()
     alias_map = {
-        "jenis": "Jenis", "persen_0_18": "0-18 tahun", "persen_gt_18": "lebih dari 18 tahun",
-        "frekuensi": "Frekuensi", "produk": "Produk yang digunakan", "tidak_ada_data": "Tidak ada data",
-        "dosis_per_kedatangan": "Dosis diterima (IU)/kedatangan", "estimasi_data_real": "Estimasi/Data real",
+        "jenis": "Jenis",
+        "persen_0_18": "0-18 tahun",
+        "persen_gt_18": "lebih dari 18 tahun",
+        "frekuensi": "Frekuensi",
+        "produk": "Produk yang digunakan",
+        "tidak_ada_data": "Tidak ada data",
+        "dosis_per_kedatangan": "Dosis diterima (IU)/kedatangan",
+        "estimasi_data_real": "Estimasi/Data real",
     }
     d.rename(columns=alias_map, inplace=True)
     hide_extra = {"id", "kode_organisasi", "created_at"}
     cols = [c for c in d.columns if c not in hide_extra]
     return d[cols]
 
+
 def process_hemofilia_inhibitor(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty: return df
+    if df.empty:
+        return df
     d = join_with_hmhi(df)
     alias_map = {
-        "hmhi_cabang": "HMHI Cabang", "label": "Jenis Hemofilia",
-        "terdiagnosis_aktif": "Terdiagnosis Inhibitor Aktif", "kasus_baru_2025": "Kasus baru 2025",
+        "Jenis Hemofilia": "Jenis Hemofilia",
+        "label": "Jenis Hemofilia",
+        "terdiagnosis_aktif": "Terdiagnosis Inhibitor Aktif",
+        "kasus_baru_2025": "Kasus baru 2025",
         "penanganan": "Penanganan",
     }
     d.rename(columns=alias_map, inplace=True)
     return reorder_cols(d, HIDE_COLS_COMMON)
 
+
 def process_infeksi_transfusi_darah(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty: return df
+    if df.empty:
+        return df
     d = df.copy()
-    alias_map = {
-        "kasus": "Kasus", "jml_hepatitis_c": "Jumlah Hepatitis C", "jml_hiv": "Jumlah HIV",
-        "penyakit_menular_lainnya": "Penyakit Menular Lainnya",
-    }
-    d.rename(columns=alias_map, inplace=True)
+    d.rename(
+        columns={
+            "kasus": "Kasus",
+            "jml_hepatitis_c": "Jumlah Hepatitis C",
+            "jml_hiv": "Jumlah HIV",
+            "penyakit_menular_lainnya": "Penyakit Menular Lainnya",
+        },
+        inplace=True,
+    )
     visible_cols = [c for c in d.columns if c not in HIDE_COLS_COMMON]
     return d[visible_cols]
+
 
 def process_informasi_donasi(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty: return df
+    if df.empty:
+        return df
     d = df.copy()
-    alias_map = {
-        "jenis_donasi": "Jenis Donasi", "merk": "Merek",
-        "jumlah_total_iu_setahun": "Jumlah Total IU/tahun", "kegunaan": "Kegunaan",
-    }
-    d.rename(columns=alias_map, inplace=True)
+    d.rename(
+        columns={
+            "jenis_donasi": "Jenis Donasi",
+            "merk": "Merek",
+            "jumlah_total_iu_setahun": "Jumlah Total IU/tahun",
+            "kegunaan": "Kegunaan",
+        },
+        inplace=True,
+    )
     visible_cols = [c for c in d.columns if c not in HIDE_COLS_COMMON]
     return d[visible_cols]
 
+
 def process_kelompok_usia(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty: return df
+    if df.empty:
+        return df
     d = join_with_hmhi(df)
-    alias_map = {
-        "hmhi_cabang": "HMHI Cabang", "kelompok_usia": "Kelompok Usia",
-        "ha_ringan": "Hemofilia A - Ringan", "ha_sedang": "Hemofilia A - Sedang",
-        "ha_berat": "Hemofilia A - Berat", "hb_ringan": "Hemofilia B - Ringan",
-        "hb_sedang": "Hemofilia B - Sedang", "hb_berat": "Hemofilia B - Berat",
-        "hemo_tipe_lain": "Hemofilia Tipe Lain", "vwd_tipe1": "vWD - Tipe 1",
-        "vwd_tipe2": "vWD - Tipe 2",
-    }
-    d.rename(columns=alias_map, inplace=True)
+    d.rename(
+        columns={
+            "kelompok_usia": "Kelompok Usia",
+            "ha_ringan": "Hemofilia A - Ringan",
+            "ha_sedang": "Hemofilia A - Sedang",
+            "ha_berat": "Hemofilia A - Berat",
+            "hb_ringan": "Hemofilia B - Ringan",
+            "hb_sedang": "Hemofilia B - Sedang",
+            "hb_berat": "Hemofilia B - Berat",
+            "hemo_tipe_lain": "Hemofilia Tipe Lain",
+            "vwd_tipe1": "vWD - Tipe 1",
+            "vwd_tipe2": "vWD - Tipe 2",
+        },
+        inplace=True,
+    )
     return reorder_cols(d, HIDE_COLS_COMMON)
+
 
 def process_kematian_hemofilia(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty: return df
+    if df.empty:
+        return df
     d = join_with_hmhi(df)
-    alias_map = {
-        "hmhi_cabang": "HMHI Cabang", "penyebab_kematian": "Penyebab Kematian",
-        "perdarahan": "Perdarahan", "gangguan_hati": "Gangguan Hati", "hiv": "HIV",
-        "penyebab_lain": "Penyebab Lain", "tahun_kematian": "Tahun Kematian",
-    }
-    d.rename(columns=alias_map, inplace=True)
+    d.rename(
+        columns={
+            "penyebab_kematian": "Penyebab Kematian",
+            "perdarahan": "Perdarahan",
+            "gangguan_hati": "Gangguan Hati",
+            "hiv": "HIV",
+            "penyebab_lain": "Penyebab Lain",
+            "tahun_kematian": "Tahun Kematian",
+        },
+        inplace=True,
+    )
     return reorder_cols(d, HIDE_COLS_COMMON)
+
 
 def process_ketersediaan_produk(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty: return df
+    if df.empty:
+        return df
     d = join_with_hmhi(df)
-    alias_map = {
-        "hmhi_cabang": "HMHI Cabang", "produk": "Produk", "ketersediaan": "Ketersediaan",
-        "digunakan": "Digunakan", "merk": "Merk", "jumlah_pengguna": "Jumlah Pengguna",
-        "jumlah_iu_per_kemasan": "Jumlah IU/vial dalam 1 kemasan", "harga": "Harga",
-    }
-    d.rename(columns=alias_map, inplace=True)
+    d.rename(
+        columns={
+            "produk": "Produk",
+            "ketersediaan": "Ketersediaan",
+            "digunakan": "Digunakan",
+            "merk": "Merk",
+            "jumlah_pengguna": "Jumlah Pengguna",
+            "jumlah_iu_per_kemasan": "Jumlah IU/vial dalam 1 kemasan",
+            "harga": "Harga",
+        },
+        inplace=True,
+    )
     return reorder_cols(d, HIDE_COLS_COMMON)
+
 
 def process_pasien_nonfaktor_inhibitor(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty: return df
+    if df.empty:
+        return df
     d = join_with_hmhi(df)
-    alias_map = {
-        "hmhi_cabang": "HMHI Cabang", "jenis_penanganan": "Jenis Penanganan",
-        "ketersediaan": "Ketersediaan", "jumlah_pengguna": "Jumlah Pengguna",
-    }
-    d.rename(columns=alias_map, inplace=True)
+    d.rename(
+        columns={
+            "jenis_penanganan": "Jenis Penanganan",
+            "ketersediaan": "Ketersediaan",
+            "jumlah_pengguna": "Jumlah Pengguna",
+        },
+        inplace=True,
+    )
     return reorder_cols(d, HIDE_COLS_COMMON)
+
 
 def process_pasien_nonfaktor_tanpa_inhibitor(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty: return df
+    if df.empty:
+        return df
     d = join_with_hmhi(df)
-    alias_map = {
-        "hmhi_cabang": "HMHI Cabang", "jenis_penanganan": "Jenis Penanganan",
-        "ketersediaan": "Ketersediaan", "jumlah_pengguna": "Jumlah Pengguna",
-    }
-    d.rename(columns=alias_map, inplace=True)
+    d.rename(
+        columns={
+            "jenis_penanganan": "Jenis Penanganan",
+            "ketersediaan": "Ketersediaan",
+            "jumlah_pengguna": "Jumlah Pengguna",
+        },
+        inplace=True,
+    )
     return reorder_cols(d, HIDE_COLS_COMMON)
+
 
 def process_penanganan_kesehatan(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty: return df
+    if df.empty:
+        return df
     d = join_with_hmhi(df)
-    alias_map = {
-        "hmhi_cabang": "HMHI Cabang", "jenis_hemofilia": "Jenis Hemofilia",
-        "jenis_penanganan": "Jenis Penanganan", "layanan_rawat": "Layanan Rawat",
-        "dosis_per_orang_per_kedatangan": "Dosis/orang/kedatangan (IU)", "frekuensi": "Frekuensi",
-    }
-    d.rename(columns=alias_map, inplace=True)
+    d.rename(
+        columns={
+            "jenis_hemofilia": "Jenis Hemofilia",
+            "jenis_penanganan": "Jenis Penanganan",
+            "layanan_rawat": "Layanan Rawat",
+            "dosis_per_orang_per_kedatangan": "Dosis/orang/kedatangan (IU)",
+            "frekuensi": "Frekuensi",
+        },
+        inplace=True,
+    )
     return reorder_cols(d, HIDE_COLS_COMMON)
 
-# <<< FUNGSI-FUNGSI BARU DITAMBAHKAN DI SINI >>>
+# === Tambahan sesuai permintaan ===
+
 def process_perkembangan_pelayanan(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty: return df
+    if df.empty:
+        return df
     d = join_with_hmhi(df)
-    alias_map = {
-        "hmhi_cabang": "HMHI Cabang", "jenis": "Jenis",
-        "jumlah_terapi_gen": "Jumlah Penyandang yang telah menjalani Terapi Gen",
-        "tahun": "Tahun", "nama_rumah_sakit": "Nama Rumah Sakit",
-        "lokasi": "Kab/Kota", "propinsi": "Propinsi",
-    }
-    d.rename(columns=alias_map, inplace=True)
+    d.rename(
+        columns={
+            "jenis": "Jenis",
+            "jumlah_terapi_gen": "Jumlah Penyandang yang telah menjalani Terapi Gen",
+            "tahun": "Tahun",
+            "nama_rumah_sakit": "Nama Rumah Sakit",
+            "lokasi": "Kab/Kota",
+            "propinsi": "Propinsi",
+        },
+        inplace=True,
+    )
     return reorder_cols(d, HIDE_COLS_COMMON)
+
 
 def process_rs_penangan_hemofilia(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty: return df
+    if df.empty:
+        return df
     d = join_with_hmhi(df)
-    alias_map = {
-        "hmhi_cabang": "HMHI Cabang", "nama_rumah_sakit": "Nama Rumah Sakit",
-        "tipe_rs": "Tipe RS", "dokter_hematologi": "Terdapat Dokter Hematologi",
-        "tim_terpadu": "Terdapat Tim Terpadu", "lokasi": "Kab/Kota", "propinsi": "Propinsi",
-    }
-    d.rename(columns=alias_map, inplace=True)
+    d.rename(
+        columns={
+            "nama_rumah_sakit": "Nama Rumah Sakit",
+            "tipe_rs": "Tipe RS",
+            "dokter_hematologi": "Terdapat Dokter Hematologi",
+            "tim_terpadu": "Terdapat Tim Terpadu",
+            "lokasi": "Kab/Kota",
+            "propinsi": "Propinsi",
+        },
+        inplace=True,
+    )
     return reorder_cols(d, HIDE_COLS_COMMON)
+
 
 def process_vwd_berat_jumlah(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty: return df
+    if df.empty:
+        return df
     d = join_with_hmhi(df)
-    alias_map = {
-        "hmhi_cabang": "HMHI Cabang", "label": "Kelainan", "jumlah": "Jumlah Penyandang",
-        "jumlah_medis": "Jumlah Penyandang vWD Berat yang Menerima Penanganan Medis",
-    }
-    d.rename(columns=alias_map, inplace=True)
+    d.rename(
+        columns={
+            "label": "Kelainan",
+            "jumlah": "Jumlah Penyandang",
+            "jumlah_medis": "Jumlah Penyandang vWD Berat yang Menerima Penanganan Medis",
+        },
+        inplace=True,
+    )
     return reorder_cols(d, HIDE_COLS_COMMON)
 
+
 def process_vwd_usia_gender(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty: return df
+    if df.empty:
+        return df
     d = join_with_hmhi(df)
-    alias_map = {
-        "hmhi_cabang": "HMHI Cabang", "kelompok_usia": "Kelompok Usia",
-        "laki_laki": "Laki-laki", "perempuan": "Perempuan",
-        "jk_tidak_terdata": "Jenis Kelamin Tidak Terdata", "total": "Total",
-    }
-    d.rename(columns=alias_map, inplace=True)
+    d.rename(
+        columns={
+            "kelompok_usia": "Kelompok Usia",
+            "laki_laki": "Laki-laki",
+            "perempuan": "Perempuan",
+            "jk_tidak_terdata": "Jenis Kelamin Tidak Terdata",
+            "total": "Total",
+        },
+        inplace=True,
+    )
     hide_cols = HIDE_COLS_COMMON.copy()
-    hide_cols.remove("is_total_row") # 'total' is a valid column here, not the flag
+    if "is_total_row" in hide_cols:
+        hide_cols.remove("is_total_row")  # 'total' adalah kolom data, bukan flag
     return reorder_cols(d, hide_cols)
 
 
 def process_generic(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty: return df
+    if df.empty:
+        return df
     d = df.copy()
     cols = [c for c in d.columns if c not in HIDE_COLS_COMMON]
     return d[cols]
 
-# <<< BAGIAN INI TELAH DIUBAH >>>
+
 def process_table(tname: str, raw: pd.DataFrame) -> pd.DataFrame:
-    # --- Existing Functions ---
-    if tname == "identitas_organisasi": return process_identitas(raw)
-    if tname == "jumlah_individu_hemofilia": return process_jumlah_individu(raw)
-    if tname == "anak_hemofilia_berat": return process_anak_berat(raw)
-    if tname == "hemo_berat_prophylaxis_usia": return process_hemo_berat_prophylaxis_usia(raw)
-    if tname == "hemofilia_inhibitor": return process_hemofilia_inhibitor(raw)
-    if tname == "infeksi_transfusi_darah": return process_infeksi_transfusi_darah(raw)
-    if tname == "informasi_donasi": return process_informasi_donasi(raw)
-    if tname == "kelompok_usia": return process_kelompok_usia(raw)
-    if tname == "kematian_hemofilia_2024kini": return process_kematian_hemofilia(raw)
-    if tname == "ketersediaan_produk_replacement": return process_ketersediaan_produk(raw)
-    if tname == "pasien_nonfaktor_inhibitor": return process_pasien_nonfaktor_inhibitor(raw)
-    if tname == "pasien_nonfaktor_tanpa_inhibitor": return process_pasien_nonfaktor_tanpa_inhibitor(raw)
-    if tname == "penanganan_kesehatan": return process_penanganan_kesehatan(raw)
+    if tname == "identitas_organisasi":
+        return process_identitas(raw)
+    if tname == "jumlah_individu_hemofilia":
+        return process_jumlah_individu(raw)
+    if tname == "anak_hemofilia_berat":
+        return process_anak_berat(raw)
+    if tname == "hemo_berat_prophylaxis_usia":
+        return process_hemo_berat_prophylaxis_usia(raw)
+    if tname == "hemofilia_inhibitor":
+        return process_hemofilia_inhibitor(raw)
+    if tname == "infeksi_transfusi_darah":
+        return process_infeksi_transfusi_darah(raw)
+    if tname == "informasi_donasi":
+        return process_informasi_donasi(raw)
+    if tname == "kelompok_usia":
+        return process_kelompok_usia(raw)
+    if tname == "kematian_hemofilia_2024kini":
+        return process_kematian_hemofilia(raw)
+    if tname == "ketersediaan_produk_replacement":
+        return process_ketersediaan_produk(raw)
+    if tname == "pasien_nonfaktor_inhibitor":
+        return process_pasien_nonfaktor_inhibitor(raw)
+    if tname == "pasien_nonfaktor_tanpa_inhibitor":
+        return process_pasien_nonfaktor_tanpa_inhibitor(raw)
+    if tname == "penanganan_kesehatan":
+        return process_penanganan_kesehatan(raw)
 
-    # --- New Functions from Request ---
-    if tname == "perkembangan_pelayanan_penanganan": return process_perkembangan_pelayanan(raw)
-    if tname == "rs_penangan_hemofilia": return process_rs_penangan_hemofilia(raw)
-    if tname == "vwd_berat_jumlah": return process_vwd_berat_jumlah(raw)
-    if tname == "vwd_usia_gender": return process_vwd_usia_gender(raw)
+    if tname == "perkembangan_pelayanan_penanganan":
+        return process_perkembangan_pelayanan(raw)
+    if tname == "rs_penangan_hemofilia":
+        return process_rs_penangan_hemofilia(raw)
+    if tname == "vwd_berat_jumlah":
+        return process_vwd_berat_jumlah(raw)
+    if tname == "vwd_usia_gender":
+        return process_vwd_usia_gender(raw)
 
-    # --- Default/Fallback ---
     return process_generic(raw)
 
 # ======================== Pratinjau per tabel ========================
 with st.expander("🔎 Pratinjau cepat (maks 200 baris per tabel)"):
     for t in sorted(tables_selected):
-        raw = read_table(t)
+        raw = read_table_public(t)
         processed = process_table(t, raw)
         prev = processed.head(200)
         label = TABLE_ALIASES.get(t, t)
@@ -451,6 +561,7 @@ with st.expander("🔎 Pratinjau cepat (maks 200 baris per tabel)"):
         st.dataframe(prev, use_container_width=True)
 
 # ======================== Util: formatting Excel ========================
+
 def autosize_and_print_setup(writer, sheet_name: str, df: pd.DataFrame):
     ws = writer.sheets[sheet_name]
     for idx, col in enumerate(df.columns):
@@ -471,7 +582,7 @@ st.subheader("⬇️ Rekapitulasi - Unduh Excel (Multi-Sheet)")
 buf = io.BytesIO()
 with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
     for t in tables_selected:
-        raw = read_table(t)
+        raw = read_table_public(t)
         df = process_table(t, raw)
         safe_name = TABLE_ALIASES.get(t, t)
         safe_name = safe_name.replace("/", "_").replace("\\", "_")[:31] or "Sheet"
