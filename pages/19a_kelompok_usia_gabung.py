@@ -89,7 +89,7 @@ def _pg_fix_id_default_if_needed():
     END $$;
     """)
 
-    # 2) Sinkronkan dengan isi tabel
+    # 2) Sinkronkan dengan isi tabel (tanpa set 0)
     exec_sql("""
     DO $$
     DECLARE
@@ -267,6 +267,15 @@ cKPI2.metric("Hemofilia B (total)", f"{total_b:,}")
 cKPI3.metric("vWD (total)", f"{(total_vwd1 + total_vwd2):,}")
 cKPI4.metric("Grand Total", f"{grand_total:,}")
 
+# Alias kolom agar seragam dengan tabel "Rekap Gabungan (Tampilan)"
+alias_map = {
+    "hemo_a": "Hemofilia A",
+    "hemo_b": "Hemofilia B",
+    "hemo_tipe_lain": "Hemofilia Tipe Lain",
+    "vwd_tipe1": "vWD - Tipe 1",
+    "vwd_tipe2": "vWD - Tipe 2",
+}
+
 # --- Tabs Analitik (3 tab saja) ---
 tab1, tab2, tab3 = st.tabs(["Ringkasan", "Per Kelompok Usia", "Per HMHI Cabang"])
 
@@ -287,18 +296,27 @@ with tab1:
 with tab2:
     st.subheader("Agregasi per Kelompok Usia")
     if "kelompok_usia" in df_num.columns:
-        usia_df = (
+        # Agregasi mentah, lalu alias kolom & label indeks
+        usia_df_raw = (
             df_num.groupby("kelompok_usia", dropna=False)[num_cols]
             .sum()
             .sort_index()
         )
-        st.dataframe(usia_df, use_container_width=True)
-        st.bar_chart(usia_df, use_container_width=True)
+        usia_df = (
+            usia_df_raw.rename(columns=alias_map)
+            .reset_index()
+            .rename(columns={"kelompok_usia": "Kelompok Usia"})
+            .set_index("Kelompok Usia")
+        )
 
-        if {"hemo_a", "hemo_b"}.issubset(usia_df.columns):
-            ratio_df = usia_df[["hemo_a", "hemo_b"]].copy()
-            ratio_df["A_B_Ratio"] = (ratio_df["hemo_a"] / ratio_df["hemo_b"]).replace([float("inf")], float("nan"))
-            ratio_df["A_B_Ratio"] = ratio_df["A_B_Ratio"].fillna(0.0)
+        st.dataframe(usia_df, use_container_width=True)          # kolom sudah beralias
+        st.bar_chart(usia_df, use_container_width=True)          # chart pakai alias
+
+        # Rasio A vs B per kelompok usia (0 jika B=0)
+        if {"Hemofilia A", "Hemofilia B"}.issubset(usia_df.columns):
+            ratio_df = usia_df[["Hemofilia A", "Hemofilia B"]].copy()
+            denom = ratio_df["Hemofilia B"].replace(0, pd.NA)
+            ratio_df["A_B_Ratio"] = (ratio_df["Hemofilia A"] / denom).fillna(0.0)
             st.write("**Rasio A vs B per Kelompok Usia** (0 jika B=0):")
             st.bar_chart(ratio_df[["A_B_Ratio"]], use_container_width=True)
     else:
@@ -308,24 +326,34 @@ with tab3:
     st.subheader("Agregasi per HMHI Cabang")
     df_cabang = raw_df.copy()
     if "HMHI Cabang" in view_df.columns:
+        # tambahkan label cabang dari view_df yang sudah beralias
         df_cabang = df_cabang.join(view_df["HMHI Cabang"])
     else:
         df_cabang["HMHI Cabang"] = None
 
     df_cabang["HMHI Cabang"] = df_cabang["HMHI Cabang"].fillna("— (Tidak terisi)")
-    cabang_df = (
+
+    # Agregasi mentah per cabang, lalu alias kolom tampilan
+    cabang_df_raw = (
         df_cabang.groupby("HMHI Cabang", dropna=False)[num_cols]
         .sum()
-        .sort_values(["hemo_a", "hemo_b"], ascending=False)
     )
-    st.dataframe(cabang_df, use_container_width=True)
-    st.bar_chart(cabang_df[["hemo_a", "hemo_b"]], use_container_width=True)
+    cabang_df = cabang_df_raw.rename(columns=alias_map)
 
-    if {"hemo_a", "hemo_b"}.issubset(cabang_df.columns):
-        cabang_df["total_hemo"] = cabang_df["hemo_a"] + cabang_df["hemo_b"]
-        top10 = cabang_df.sort_values("total_hemo", ascending=False).head(10)
+    # Urutkan berdasarkan Hemofilia A lalu Hemofilia B (keduanya sudah alias)
+    sort_cols = [c for c in ["Hemofilia A", "Hemofilia B"] if c in cabang_df.columns]
+    if sort_cols:
+        cabang_df = cabang_df.sort_values(sort_cols, ascending=False)
+
+    st.dataframe(cabang_df, use_container_width=True)                         # kolom sudah beralias
+    if {"Hemofilia A", "Hemofilia B"}.issubset(cabang_df.columns):
+        st.bar_chart(cabang_df[["Hemofilia A", "Hemofilia B"]], use_container_width=True)
+
+        # Top 10 berdasarkan total Hemofilia (A+B)
+        cabang_df["Total Hemofilia (A+B)"] = cabang_df["Hemofilia A"] + cabang_df["Hemofilia B"]
+        top10 = cabang_df.sort_values("Total Hemofilia (A+B)", ascending=False).head(10)
         st.write("**Top 10 HMHI Cabang (Hemofilia A+B):**")
-        st.dataframe(top10[["total_hemo", "hemo_a", "hemo_b"]], use_container_width=True)
+        st.dataframe(top10[["Total Hemofilia (A+B)", "Hemofilia A", "Hemofilia B"]], use_container_width=True)
 
 # ==================== Unduh Excel ====================
 st.divider()
