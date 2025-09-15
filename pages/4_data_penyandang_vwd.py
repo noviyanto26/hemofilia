@@ -1,18 +1,22 @@
 import streamlit as st
-import sqlite3
 import pandas as pd
 from datetime import datetime
 import io
 
+# ===== Halaman =====
 st.set_page_config(page_title="Data Penyandang vWD", page_icon="🩸", layout="wide")
 st.title("🩸 Data Penyandang von Willebrand Disease (vWD) — per Kelompok Usia & Jenis Kelamin")
 
-DB_PATH = "hemofilia.db"
-TABLE = "vwd_usia_gender"
+# ===== Target tabel di Supabase/Postgres =====
+SUPABASE_TABLE = "public.vwd_usia_gender"
+IDENTITAS_TABLE = "public.identitas_organisasi"
 
-# Urutan kelompok usia (tampilan input)
+# Konektor ke Postgres (via db.py)
+# Harus tersedia fungsi: fetch_df(sql, params=None), execute(sql, params=None), run_ddl(ddl)
+from db import fetch_df as pg_fetch_df, execute as pg_execute, run_ddl
+
+# ===== Konstanta UI/Data =====
 AGE_GROUPS = ["0-4", "5-13", "14-18", "19-44", ">45", "Tidak ada data usia"]
-# Urutan baris di template unggah
 TEMPLATE_AGE_ORDER = [">45", "19-44", "14-18", "5-13", "0-4"]
 
 GENDER_COLS = [
@@ -22,153 +26,34 @@ GENDER_COLS = [
 ]
 TOTAL_LABEL = "Total"
 
-# ===== Kolom template unggah & pemetaan alias =====
 TEMPLATE_COLUMNS = [
     "HMHI cabang",
     "Kelompok Usia",
     "Laki-Laki",
     "Perempuan",
     "Jenis Kelamin Tidak Terdata",
-    "Total",  # boleh diisi atau dikosongkan (akan dihitung otomatis)
+    "Total",
 ]
-ALIAS_TO_DB = {
-    "HMHI cabang": "hmhi_cabang_info",
-    "Kelompok Usia": "kelompok_usia",
-    "Laki-Laki": "laki_laki",
-    "Perempuan": "perempuan",
-    "Jenis Kelamin Tidak Terdata": "jk_tidak_terdata",
-    "Total": "total",
-}
 
-# ---------- Util DB ----------
-def connect():
-    return sqlite3.connect(DB_PATH)
-
-def _has_column(conn, table, col):
-    cur = conn.cursor()
-    cur.execute(f"PRAGMA table_info({table})")
-    return any((row[1] == col) for row in cur.fetchall())
-
-def _table_exists(conn, table):
-    cur = conn.cursor()
-    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,))
-    return cur.fetchone() is not None
-
-# ---------- Migrasi kolom kode_organisasi jika belum ada ----------
-def migrate_add_kode_organisasi_if_needed():
-    with connect() as conn:
-        if not _table_exists(conn, TABLE):
-            return
-        if _has_column(conn, TABLE, "kode_organisasi"):
-            return
-
-        st.warning("Migrasi skema vWD: menambahkan kolom kode_organisasi...")
-        cur = conn.cursor()
-        cur.execute("PRAGMA foreign_keys=OFF")
-        try:
-            cols_sql = "kelompok_usia TEXT, " + ", ".join([f"{k} INTEGER" for k, _ in GENDER_COLS] + ["total INTEGER"])
-            cur.execute(f"""
-                CREATE TABLE IF NOT EXISTS {TABLE}_new (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    kode_organisasi TEXT,
-                    created_at TEXT NOT NULL,
-                    {cols_sql},
-                    FOREIGN KEY (kode_organisasi) REFERENCES identitas_organisasi(kode_organisasi)
-                )
-            """)
-            select_cols = "created_at, kelompok_usia, " + ", ".join([k for k, _ in GENDER_COLS]) + ", total"
-            cur.execute(f"""
-                INSERT INTO {TABLE}_new (id, kode_organisasi, created_at, kelompok_usia, {", ".join([k for k, _ in GENDER_COLS])}, total)
-                SELECT id, NULL as kode_organisasi, {select_cols}
-                FROM {TABLE}
-                ORDER BY id
-            """)
-            cur.execute(f"ALTER TABLE {TABLE} RENAME TO {TABLE}_backup")
-            cur.execute(f"ALTER TABLE {TABLE}_new RENAME TO {TABLE}")
-            conn.commit()
-            st.success("Migrasi selesai. Tabel lama disimpan sebagai _backup.")
-        except Exception as e:
-            conn.rollback()
-            st.error(f"Migrasi vWD gagal: {e}")
-        finally:
-            cur.execute("PRAGMA foreign_keys=ON")
-
-# ---------- Init tabel (skema final) ----------
-def init_db():
-    cols_sql = "kelompok_usia TEXT, " + ", ".join([f"{k} INTEGER" for k, _ in GENDER_COLS] + ["total INTEGER"])
-    with connect() as conn:
-        c = conn.cursor()
-        c.execute(f"""
-            CREATE TABLE IF NOT EXISTS {TABLE} (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                kode_organisasi TEXT,
-                created_at TEXT NOT NULL,
-                {cols_sql},
-                FOREIGN KEY (kode_organisasi) REFERENCES identitas_organisasi(kode_organisasi)
-            )
-        """)
-        conn.commit()
-
-# ---------- Helpers ----------
-def load_hmhi_to_kode():
+# ====== DDL: pastikan tabel ada (idempotent) ======
+run_ddl(
+    f"""
+    CREATE TABLE IF NOT EXISTS {SUPABASE_TABLE} (
+        id BIGSERIAL PRIMARY KEY,
+        kode_organisasi TEXT REFERENCES {IDENTITAS_TABLE}(kode_organisasi),
+        created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+        kelompok_usia TEXT,
+        laki_laki INTEGER,
+        perempuan INTEGER,
+        jk_tidak_terdata INTEGER,
+        total INTEGER
+    );
+    CREATE INDEX IF NOT EXISTS idx_vwd_created_at ON {SUPABASE_TABLE}(created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_vwd_kode ON {SUPABASE_TABLE}(kode_organisasi);
     """
-    Ambil pilihan dari identitas_organisasi.hmhi_cabang dan petakan ke kode_organisasi.
-    Return:
-        mapping: dict {hmhi_cabang -> kode_organisasi}
-        options: list hmhi_cabang (urut alfabet)
-    """
-    with connect() as conn:
-        try:
-            df = pd.read_sql_query(
-                "SELECT kode_organisasi, hmhi_cabang FROM identitas_organisasi ORDER BY id DESC",
-                conn
-            )
-            if df.empty:
-                return {}, []
-            mapping = {}
-            for _, row in df.iterrows():
-                hmhi_val = str(row["hmhi_cabang"]).strip() if pd.notna(row["hmhi_cabang"]) else ""
-                kode_val = str(row["kode_organisasi"]).strip() if pd.notna(row["kode_organisasi"]) else ""
-                if hmhi_val:
-                    mapping[hmhi_val] = kode_val
-            options = sorted(mapping.keys())
-            return mapping, options
-        except Exception:
-            return {}, []
+)
 
-def insert_row(payload: dict, kode_organisasi: str):
-    with connect() as conn:
-        c = conn.cursor()
-        keys = list(payload.keys())
-        cols = ", ".join(keys)
-        placeholders = ", ".join(["?"] * len(keys))
-        vals = [payload[k] for k in keys]
-        c.execute(
-            f"INSERT INTO {TABLE} (kode_organisasi, created_at, {cols}) VALUES (?, ?, {placeholders})",
-            [kode_organisasi, datetime.utcnow().isoformat()] + vals
-        )
-        conn.commit()
-
-def read_with_join(limit=300):
-    with connect() as conn:
-        if not _has_column(conn, TABLE, "kode_organisasi"):
-            st.error("Kolom 'kode_organisasi' belum tersedia pada tabel vWD. Coba refresh setelah migrasi.")
-            return pd.read_sql_query(f"SELECT * FROM {TABLE} ORDER BY id DESC LIMIT ?", conn, params=[limit])
-
-        return pd.read_sql_query(
-            f"""
-            SELECT
-              v.id, v.kode_organisasi, v.created_at, v.kelompok_usia,
-              v.laki_laki, v.perempuan, v.jk_tidak_terdata, v.total,
-              io.kota_cakupan_cabang, io.hmhi_cabang
-            FROM {TABLE} v
-            LEFT JOIN identitas_organisasi io ON io.kode_organisasi = v.kode_organisasi
-            ORDER BY v.id DESC
-            LIMIT ?
-            """,
-            conn, params=[limit]
-        )
-
+# ===== Helpers =====
 def safe_int(val):
     try:
         x = pd.to_numeric(val, errors="coerce")
@@ -178,20 +63,59 @@ def safe_int(val):
     except Exception:
         return 0
 
-# ---------- Startup ----------
-migrate_add_kode_organisasi_if_needed()
-init_db()
 
-# ---------- UI ----------
-tab_input, tab_data = st.tabs(["📝 Input", "📄 Data"])
+def load_hmhi_to_kode():
+    """Ambil mapping hmhi_cabang -> kode_organisasi dari tabel identitas."""
+    try:
+        df = pg_fetch_df(
+            f"""
+            SELECT kode_organisasi, hmhi_cabang
+            FROM {IDENTITAS_TABLE}
+            WHERE COALESCE(hmhi_cabang,'') <> ''
+            ORDER BY hmhi_cabang
+            """
+        )
+        if df.empty:
+            return {}, []
+        mapping = {str(r.hmhi_cabang).strip(): str(r.kode_organisasi).strip() for _, r in df.iterrows() if str(r.hmhi_cabang).strip()}
+        return mapping, sorted(mapping.keys())
+    except Exception:
+        return {}, []
+
+
+def insert_row(payload: dict, kode_organisasi: str):
+    sql = f"""
+        INSERT INTO {SUPABASE_TABLE}
+            (kode_organisasi, created_at, kelompok_usia, laki_laki, perempuan, jk_tidak_terdata, total)
+        VALUES
+            (:kode_organisasi, NOW(), :kelompok_usia, :laki_laki, :perempuan, :jk_tidak_terdata, :total)
+    """
+    params = {"kode_organisasi": kode_organisasi, **payload}
+    pg_execute(sql, params)
+
+
+def read_with_join(limit=300):
+    sql = f"""
+        SELECT
+          v.id, v.kode_organisasi, v.created_at, v.kelompok_usia,
+          v.laki_laki, v.perempuan, v.jk_tidak_terdata, v.total,
+          io.kota_cakupan_cabang, io.hmhi_cabang
+        FROM {SUPABASE_TABLE} v
+        LEFT JOIN {IDENTITAS_TABLE} io ON io.kode_organisasi = v.kode_organisasi
+        ORDER BY v.id DESC
+        LIMIT :limit
+    """
+    return pg_fetch_df(sql, {"limit": int(limit)})
+
+# ===== UI =====
+tab_input, tab_data = st.tabs(["📝 Input", "📄 Data"]) 
 
 with tab_input:
     st.caption("Isi jumlah Laki-Laki, Perempuan, dan Tidak Terdata untuk setiap kelompok usia. **Total** dihitung otomatis.")
 
-    # 🔁 Sumber pilihan: hmhi_cabang → kode_organisasi
     hmhi_map, hmhi_list = load_hmhi_to_kode()
     if not hmhi_list:
-        st.warning("Belum ada data Identitas Organisasi (kolom HMHI cabang). Harap isi dulu.")
+        st.warning("Belum ada data Identitas Organisasi (kolom HMHI cabang). Harap isi dulu di halaman Identitas.")
         selected_hmhi = None
     else:
         selected_hmhi = st.selectbox(
@@ -200,7 +124,7 @@ with tab_input:
             key="vwd::hmhi_select"
         )
 
-    df_default = pd.DataFrame(0, index=AGE_GROUPS, columns=[k for k, _ in GENDER_COLS] + ["total"])
+    df_default = pd.DataFrame(0, index=AGE_GROUPS, columns=[k for k, _ in GENDER_COLS] + ["total"]) 
     df_default.index.name = "Kelompok Usia"
 
     col_config = {k: st.column_config.NumberColumn(label=lbl, min_value=0, step=1) for k, lbl in GENDER_COLS}
@@ -214,7 +138,7 @@ with tab_input:
             use_container_width=True,
             num_rows="fixed",
         )
-        # Hitung total per baris (Series → aman pakai fillna)
+        # Hitung total per baris
         try:
             edited["total"] = (
                 pd.to_numeric(edited["laki_laki"], errors="coerce").fillna(0).astype(int) +
@@ -259,7 +183,7 @@ with tab_data:
             "Laki-Laki": 0,
             "Perempuan": 0,
             "Jenis Kelamin Tidak Terdata": 0,
-            "Total": 0,  # boleh pust, akan dihitung jika kosong
+            "Total": 0,
         }
         tmpl_records.append(row)
     tmpl_df = pd.DataFrame(tmpl_records, columns=TEMPLATE_COLUMNS)
@@ -279,8 +203,16 @@ with tab_data:
     if df_x.empty:
         st.info("Belum ada data.")
     else:
-        order = ["hmhi_cabang", "kota_cakupan_cabang", "created_at", "kelompok_usia",
-                 "laki_laki", "perempuan", "jk_tidak_terdata", "total"]
+        order = [
+            "hmhi_cabang",
+            "kota_cakupan_cabang",
+            "created_at",
+            "kelompok_usia",
+            "laki_laki",
+            "perempuan",
+            "jk_tidak_terdata",
+            "total",
+        ]
         order = [c for c in order if c in df_x.columns]
 
         view = df_x[order].rename(columns={
@@ -313,7 +245,7 @@ with tab_data:
     up = st.file_uploader(
         "Pilih file Excel (.xlsx) dengan header persis seperti template",
         type=["xlsx"],
-        key="vwd::uploader"
+        key="vwd::uploader",
     )
 
     if up is not None:
@@ -331,6 +263,14 @@ with tab_data:
             st.stop()
 
         # alias -> key internal
+        ALIAS_TO_DB = {
+            "HMHI cabang": "hmhi_cabang_info",
+            "Kelompok Usia": "kelompok_usia",
+            "Laki-Laki": "laki_laki",
+            "Perempuan": "perempuan",
+            "Jenis Kelamin Tidak Terdata": "jk_tidak_terdata",
+            "Total": "total",
+        }
         df_up = raw.rename(columns=ALIAS_TO_DB).copy()
 
         # Pratinjau
@@ -341,10 +281,9 @@ with tab_data:
             hmhi_map, _ = load_hmhi_to_kode()
             results = []
 
-            nrows = len(df_up)
-            for i in range(nrows):
+            for i in range(len(df_up)):
                 try:
-                    s = df_up.iloc[i]  # Series
+                    s = df_up.iloc[i]
                     hmhi = str((s.get("hmhi_cabang_info") or "")).strip()
                     if not hmhi:
                         raise ValueError("Kolom 'HMHI cabang' kosong.")
@@ -352,13 +291,10 @@ with tab_data:
                     if not kode_organisasi:
                         raise ValueError(f"HMHI cabang '{hmhi}' tidak ditemukan di identitas_organisasi.")
 
-                    # Ambil angka
                     laki = safe_int(s.get("laki_laki"))
                     pr = safe_int(s.get("perempuan"))
                     nd = safe_int(s.get("jk_tidak_terdata"))
-                    total = s.get("total")
-                    total = safe_int(total)
-                    # Jika total kosong/0 namun komponen ada, hitung
+                    total = safe_int(s.get("total"))
                     if total == 0 and (laki or pr or nd):
                         total = laki + pr + nd
 
@@ -397,5 +333,5 @@ with tab_data:
                 log_buf.getvalue(),
                 file_name="log_hasil_unggah_vwd.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                key="vwd::dl_log"
+                key="vwd::dl_log",
             )
