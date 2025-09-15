@@ -1,19 +1,10 @@
-
+# 20_rekap_gender_per_kelainan.py — Postgres-ready via db.py (fallback SQLite)
 import streamlit as st
 import pandas as pd
 import io
 
 from db import read_sql_df, ping
-
-# Robust dialect detection (handles "postgresql", "postgresql+psycopg2", etc.)
-def _is_postgres() -> bool:
-    try:
-        d = str(ping()).lower()
-    except Exception:
-        d = ""
-    return ("postgre" in d) or ("psycopg2" in d)
-
-IS_PG = _is_postgres()
+IS_PG = (ping() == "postgresql")
 
 # ===================== Konfigurasi Halaman =====================
 st.set_page_config(page_title="Rekap Gender per Kelainan", page_icon="📊", layout="wide")
@@ -39,30 +30,23 @@ DB_NUM_COLS = [c for c, _ in GENDER_COLS] + [TOTAL_COL]
 
 # ===================== Helpers DB =====================
 def table_exists(table: str) -> bool:
-    """Database-agnostic table existence check.
-    - Postgres: information_schema + current_schemas(true) to respect search_path (e.g., public)
-    - SQLite: sqlite_master
-    """
-    if IS_PG:
+    # Perbaikan dari galat sebelumnya untuk menangani PG/SQLite
+    try:
         df = read_sql_df(
-            '''
-            SELECT 1
-            FROM information_schema.tables
-            WHERE table_schema = ANY (current_schemas(true))
+            """
+            SELECT 1 FROM information_schema.tables
+            WHERE table_schema NOT IN ('pg_catalog','information_schema')
               AND table_name = :t
-            ''',
-            {"t": table}
+            """, {"t": table}
         )
-        return not df.empty
-    else:
-        df = read_sql_df(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name=:t",
-            {"t": table}
-        )
-        return not df.empty
+    except Exception:
+        df = read_sql_df("SELECT name FROM sqlite_master WHERE type='table' AND name=:t", {"t": table})
+
+    return not df.empty
 
 def load_all() -> pd.DataFrame:
-    """Ambil SEMUA data dari gender_per_kelainan + join identitas_organisasi.
+    """
+    Ambil SEMUA data dari gender_per_kelainan + join identitas_organisasi.
     Kolom:
       g.created_at, g.kelainan, g.laki_laki, g.perempuan, g.tidak_ada_data_gender, g.total, g.is_total_row,
       g.kode_organisasi, io.hmhi_cabang, io.kota_cakupan_cabang
@@ -82,21 +66,10 @@ def load_all() -> pd.DataFrame:
     """
     df = read_sql_df(sql)
 
-    # Normalisasi tipe numerik
     for c in DB_NUM_COLS:
-        df[c] = pd.to_numeric(df.get(c), errors="coerce").fillna(0).clip(lower=0).astype(int)
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).clip(lower=0).astype(int)
 
-    # Normalisasi flag is_total_row
-    if "is_total_row" in df.columns:
-        df["is_total_row"] = df["is_total_row"].astype(str).str.strip().fillna("")
-    else:
-        df["is_total_row"] = ""
-
-    # Pastikan kolom join tersedia meski NULL
-    for extra in ["hmhi_cabang", "kota_cakupan_cabang"]:
-        if extra not in df.columns:
-            df[extra] = None
-
+    df["is_total_row"] = df.get("is_total_row", "").astype(str).str.strip().fillna("")
     return df
 
 def alias_df(df: pd.DataFrame) -> pd.DataFrame:
@@ -250,6 +223,14 @@ with tab_unduh:
     }])).rename(columns={"total": "Total"})
 
     raw_preview = alias_df(df_raw.copy())
+
+    # =============================================================================
+    # PERBAIKAN: Hapus informasi timezone dari kolom 'Created At' sebelum ekspor
+    # ke Excel untuk menghindari ValueError.
+    # =============================================================================
+    if 'Created At' in raw_preview.columns:
+        raw_preview['Created At'] = pd.to_datetime(raw_preview['Created At']).dt.tz_localize(None)
+
 
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="xlsxwriter") as w:
