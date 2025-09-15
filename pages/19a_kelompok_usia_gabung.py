@@ -2,13 +2,13 @@
 import io
 import pandas as pd
 import streamlit as st
+from sqlalchemy import text
 
 # ====== Koneksi via util db.py (Postgres-ready dengan fallback SQLite) ======
-# Wajib tersedia:
+# db.py minimal menyediakan:
 # - get_engine(): sqlalchemy Engine
 # - exec_sql(sql: str, params: dict|None)
-# - fetch_df(sql: str, params: dict|None) -> pandas.DataFrame
-from db import get_engine, exec_sql, fetch_df
+from db import get_engine, exec_sql
 
 PAGE_TITLE = "🧮 Rekap Gabungan Kelompok Usia (Rebuild)"
 SRC_TABLE = "kelompok_usia"
@@ -18,21 +18,24 @@ ORG_TABLE = "identitas_organisasi"   # untuk ambil HMHI Cabang (join via kode_or
 st.set_page_config(page_title="Rekap Gabungan Kelompok Usia", page_icon="🧮", layout="wide")
 st.title(PAGE_TITLE)
 
+# ---------- fetch_df lokal (tanpa mengubah db.py) ----------
+def fetch_df(sql: str, params: dict | None = None) -> pd.DataFrame:
+    eng = get_engine()
+    with eng.connect() as conn:
+        return pd.read_sql_query(text(sql), conn, params=params or {})
 
 # ---------- Helper Dialect ----------
-def _is_postgres():
+def _is_postgres() -> bool:
     try:
         eng = get_engine()
         return (eng.dialect.name or "").lower() in ("postgresql", "postgres")
     except Exception:
         return False
 
-
 # ---------- DDL: create table if not exists ----------
 def ensure_dst_table():
     """
-    Buat tabel gabungan jika belum ada.
-    Skema generik; sesuaikan tipe jika perlu.
+    Buat tabel gabungan jika belum ada (Postgres/SQLite aware).
     """
     if _is_postgres():
         # Postgres
@@ -49,7 +52,6 @@ def ensure_dst_table():
             vwd_tipe2 INTEGER DEFAULT 0
         );
         """)
-        # (Opsional) index untuk query cepat
         exec_sql(f"CREATE INDEX IF NOT EXISTS idx_{DST_TABLE}_kode_usia ON {DST_TABLE}(kode_organisasi, kelompok_usia);")
     else:
         # SQLite
@@ -68,7 +70,6 @@ def ensure_dst_table():
         """)
         exec_sql(f"CREATE INDEX IF NOT EXISTS idx_{DST_TABLE}_kode_usia ON {DST_TABLE}(kode_organisasi, kelompok_usia);")
 
-
 # ---------- REBUILD: truncate + insert (tanpa kolom id) ----------
 def rebuild_gabungan():
     """
@@ -79,7 +80,7 @@ def rebuild_gabungan():
     ensure_dst_table()
 
     if _is_postgres():
-        # Kosongkan dan reset identity
+        # Kosongkan dan reset identity (hindari UniqueViolation)
         exec_sql(f"TRUNCATE TABLE {DST_TABLE} RESTART IDENTITY;")
     else:
         # SQLite: hapus isi + reset autoincrement
@@ -87,8 +88,7 @@ def rebuild_gabungan():
         try:
             exec_sql(f"DELETE FROM sqlite_sequence WHERE name = '{DST_TABLE}';")
         except Exception:
-            # sqlite_sequence mungkin belum ada
-            pass
+            pass  # sqlite_sequence bisa belum ada
 
     # Insert-agregasi dari sumber
     exec_sql(f"""
@@ -108,7 +108,7 @@ def rebuild_gabungan():
         FROM {SRC_TABLE} ku
     """)
 
-    # (Opsional) Sinkronkan sequence jika pernah ada insert manual id di masa lalu
+    # (Opsional) sinkronkan sequence jika dulu pernah menyisipkan id manual
     if _is_postgres():
         exec_sql(f"""
         SELECT setval(
@@ -117,34 +117,30 @@ def rebuild_gabungan():
         );
         """)
 
-
 # ---------- READ: tampilan gabungan + join HMHI Cabang ----------
 def read_joined_df():
     """
     Tampilkan data gabungan + HMHI Cabang.
-    Catatan kolom 'hmhi_cabang' bisa berbeda (mis. HMHI_cabang).
-    Sesuaikan alias di SELECT jika nama kolom Anda lain.
+    Nama kolom HMHI di identitas_organisasi bisa bervariasi; dicoba beberapa kemungkinan.
     """
-    # Coba dua kemungkinan nama kolom HMHI: hmhi_cabang / "HMHI Cabang"
-    # (Anda bisa mengunci salah satu jika sudah pasti)
     try_cols = ["hmhi_cabang", '"HMHI Cabang"', '"HMHI_cabang"', "HMHI_cabang", "HMHI_CABANG"]
 
-    # susun SELECT dinamis untuk pertama kolom HMHI yang valid
     hmhi_col_expr = None
     for c in try_cols:
-        # kita uji cepat: coba SELECT 1 kolom, jika gagal lanjut
         try:
-            _ = fetch_df(f"SELECT {c} FROM {ORG_TABLE} LIMIT 0;")  # tidak ambil data, hanya validasi kolom
+            _ = fetch_df(f"SELECT {c} FROM {ORG_TABLE} LIMIT 0;")  # uji keberadaan kolom
             hmhi_col_expr = c
             break
         except Exception:
             continue
 
     if hmhi_col_expr is None:
-        # fallback: tetap join tapi tampilkan NULL
         hmhi_select = "NULL AS hmhi_cabang"
+        order_expr = "hmhi_cabang"
     else:
         hmhi_select = f"{hmhi_col_expr} AS hmhi_cabang"
+        # untuk ORDER BY, gunakan alias yang sama setelah SELECT agar portable
+        order_expr = "hmhi_cabang"
 
     sql = f"""
         SELECT
@@ -161,32 +157,15 @@ def read_joined_df():
         FROM {DST_TABLE} g
         LEFT JOIN {ORG_TABLE} o
           ON o.kode_organisasi = g.kode_organisasi
-        ORDER BY o.{hmhi_select} NULLS LAST, g.kelompok_usia
+        ORDER BY {order_expr} NULLS LAST, g.kelompok_usia
     """
     try:
         df = fetch_df(sql)
     except Exception:
-        # Jika DB tidak dukung "NULLS LAST" (SQLite), hapus klausa itu.
-        sql_sqlite = f"""
-            SELECT
-                g.id,
-                g.kode_organisasi,
-                g.created_at,
-                o.{hmhi_select},
-                g.kelompok_usia,
-                g.hemo_a,
-                g.hemo_b,
-                g.hemo_tipe_lain,
-                g.vwd_tipe1,
-                g.vwd_tipe2
-            FROM {DST_TABLE} g
-            LEFT JOIN {ORG_TABLE} o
-              ON o.kode_organisasi = g.kode_organisasi
-            ORDER BY o.{hmhi_select}, g.kelompok_usia
-        """
+        # SQLite tidak dukung "NULLS LAST"
+        sql_sqlite = sql.replace(" NULLS LAST", "")
         df = fetch_df(sql_sqlite)
 
-    # Alias kolom untuk tampilan (sembunyikan id, kode_organisasi, created_at)
     view_df = df.copy()
     if "hmhi_cabang" in view_df.columns:
         view_df.rename(columns={"hmhi_cabang": "HMHI Cabang"}, inplace=True)
@@ -199,7 +178,6 @@ def read_joined_df():
         "vwd_tipe2": "vWD - Tipe 2",
     }, inplace=True)
 
-    # piih kolom urut tampilan
     cols_order = [c for c in [
         "HMHI Cabang", "Kelompok Usia", "Hemofilia A", "Hemofilia B",
         "Hemofilia Tipe Lain", "vWD - Tipe 1", "vWD - Tipe 2"
@@ -208,14 +186,13 @@ def read_joined_df():
     view_df = view_df[cols_order] if cols_order else view_df
     return df, view_df
 
-
 # ---------- UI ----------
 with st.expander("ℹ️ Keterangan", expanded=True):
     st.markdown("""
 - **Rebuild Rekap** akan mengosongkan tabel gabungan dan mengisinya ulang dari tabel sumber **kelompok_usia**.
-- Konflik primary key `id` tidak terjadi lagi karena **tidak menyalin `id`** dari sumber.
-- Tampilan di bawah sudah **join HMHI Cabang** dari `identitas_organisasi`.
-- Anda dapat **mengunduh Excel** hasil rekap untuk pelaporan.
+- Konflik primary key `id` dihindari karena **tidak menyalin `id`** dari sumber.
+- Tampilan sudah **join HMHI Cabang** dari `identitas_organisasi`.
+- Bisa **unduh Excel** hasil rekap.
 """)
 
 c1, c2 = st.columns([1, 3])
@@ -232,19 +209,15 @@ with c2:
 
 st.divider()
 
-# Tampilkan data
 raw_df, view_df = read_joined_df()
 
 st.subheader("📊 Rekap Gabungan (Tampilan)")
 st.dataframe(view_df, use_container_width=True, hide_index=True)
 
-# Unduh Excel
 st.subheader("⬇️ Unduh Rekap (Excel)")
 with io.BytesIO() as buffer:
     with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
-        # Sheet 'rekap_tampilan'
         view_df.to_excel(writer, index=False, sheet_name="rekap_tampilan")
-        # Sheet 'rekap_raw' (bila perlu audit)
         raw_df.to_excel(writer, index=False, sheet_name="rekap_raw")
     data = buffer.getvalue()
 st.download_button(
