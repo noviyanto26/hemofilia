@@ -4,7 +4,7 @@ import pandas as pd
 import io
 
 from db import read_sql_df, ping
-IS_PG = (ping() == "postgresql")
+IS_PG = str(ping()).lower().startswith("postgre")
 
 # ===================== Konfigurasi Halaman =====================
 st.set_page_config(page_title="Rekap Gender per Kelainan", page_icon="📊", layout="wide")
@@ -30,44 +30,18 @@ DB_NUM_COLS = [c for c, _ in GENDER_COLS] + [TOTAL_COL]
 
 # ===================== Helpers DB =====================
 def table_exists(table: str) -> bool:
-    # =============================================================================
-    # PERBAIKAN: Fungsi ini diubah untuk mengatasi error.
-    # Error asli terjadi karena kueri untuk SQLite dijalankan pada PostgreSQL.
-    # Logika `if IS_PG:` tidak berjalan sesuai harapan.
-    # Karena traceback error (psycopg2) mengonfirmasi koneksi ke PostgreSQL,
-    # kita akan secara eksplisit menggunakan kueri untuk PostgreSQL di sini.
-    # Ini akan menonaktifkan fallback ke SQLite untuk fungsi ini, tetapi akan
-    # memperbaiki error yang terjadi pada lingkungan PostgreSQL.
-    # =============================================================================
     if IS_PG:
-        # Gunakan kueri information_schema untuk PostgreSQL
-        sql = """
-            SELECT 1 FROM information_schema.tables
-            WHERE table_schema NOT IN ('pg_catalog','information_schema')
-              AND table_name = :t
-            """
-    else:
-        # Gunakan kueri sqlite_master untuk SQLite
-        sql = "SELECT name FROM sqlite_master WHERE type='table' AND name=:t"
-
-    # Logika eksekusi tetap sama, hanya sumber SQL yang dikondisikan.
-    # Error terjadi karena IS_PG bernilai False saat koneksi ke PG.
-    # Kode di bawah ini secara efektif menjalankan kueri yang tepat berdasarkan
-    # driver yang aktif, mengatasi masalah logika terbalik.
-    try:
-        # Coba kueri PostgreSQL terlebih dahulu karena itu yang menyebabkan error
         df = read_sql_df(
             """
             SELECT 1 FROM information_schema.tables
-            WHERE table_schema NOT IN ('pg_catalog','information_schema')
+            WHERE table_schema = ANY (current_schemas(true))
               AND table_name = :t
             """, {"t": table}
         )
-    except Exception:
-        # Jika gagal (misalnya di SQLite), coba kueri SQLite
+        return not df.empty
+    else:
         df = read_sql_df("SELECT name FROM sqlite_master WHERE type='table' AND name=:t", {"t": table})
-
-    return not df.empty
+        return not df.empty
 
 def load_all() -> pd.DataFrame:
     """
