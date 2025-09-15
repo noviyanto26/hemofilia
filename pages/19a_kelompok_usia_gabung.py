@@ -1,19 +1,21 @@
 # 19a_kelompok_usia_gabung.py — Postgres-ready via db.py (fallback SQLite)
-import pandas as pd
-import streamlit as st
+from __future__ import annotations
+
 import io
 from typing import Optional, List
 from datetime import datetime
-import plotly.express as px
 
-from db import read_sql_df, exec_sql, get_engine, ping
+import pandas as pd
+import plotly.express as px
+import streamlit as st
 from sqlalchemy import text
+
+from db import read_sql_df, exec_sql, table_exists, ping
 
 # ======================== Konfigurasi Halaman ========================
 st.set_page_config(page_title="Kelompok Usia (Gabung)", page_icon="🧮", layout="wide")
 st.title("🧮 Rekap Gabungan Kelompok Usia")
 
-IS_PG = (ping() == "postgresql")
 SRC_TABLE = "kelompok_usia"
 DST_TABLE = "kelompok_usia_gabung"
 ORG_TABLE = "identitas_organisasi"
@@ -24,51 +26,55 @@ KLP_LABEL_KOSONG = "Tidak ada data usia"
 KLP_ORDER_EXT = KLP_ORDER + [KLP_LABEL_KOSONG]
 
 # ======================== Util DB umum ========================
-def table_exists(table: str) -> bool:
-    if IS_PG:
-        df = read_sql_df(
-            """
-            SELECT 1
-            FROM information_schema.tables
-            WHERE table_schema NOT IN ('pg_catalog','information_schema')
-              AND table_name = :t
-            """,
-            {"t": table}
-        )
-        return not df.empty
-    else:
-        df = read_sql_df(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name=:t",
-            {"t": table}
-        )
-        return not df.empty
-
 def get_columns(table: str) -> List[str]:
+    """
+    Daftar kolom lintas-DB.
+    1) Coba information_schema (Postgres).
+    2) Fallback PRAGMA (SQLite).
+    """
     if not table_exists(table):
         return []
-    if IS_PG:
+
+    # Postgres / ANSI first
+    try:
         df = read_sql_df(
             """
             SELECT column_name
             FROM information_schema.columns
-            WHERE table_name = :t
+            WHERE table_schema = current_schema()
+              AND table_name = :t
             ORDER BY ordinal_position
             """,
             {"t": table}
         )
-        return df["column_name"].tolist() if not df.empty else []
-    else:
-        # PRAGMA compatible via SQLite only
+        if not df.empty:
+            return df["column_name"].tolist()
+    except Exception:
+        pass
+
+    # SQLite fallback
+    try:
         df = read_sql_df(f'PRAGMA table_info("{table}")')
-        return df[1].tolist() if not df.empty else []
+        # kolom "name" adalah nama kolom di PRAGMA table_info
+        if not df.empty:
+            # compat: kadang pandas mengembalikan integer index (1) utk nama; prefer "name" jika ada
+            if "name" in df.columns:
+                return df["name"].astype(str).tolist()
+            elif 1 in df.columns:
+                return df[1].astype(str).tolist()
+    except Exception:
+        pass
+
+    return []
 
 def ensure_dst_table():
-    """Buat tabel tujuan hanya untuk SQLite lokal. Di Postgres, siapkan lewat schema_postgres.sql."""
-    if IS_PG:
-        return
+    """
+    Buat tabel tujuan bila belum ada, dengan skema yang cocok untuk SQL kamu.
+    Skema generik ini compatible untuk Postgres & SQLite.
+    """
     exec_sql(f"""
         CREATE TABLE IF NOT EXISTS {DST_TABLE} (
-            id INTEGER PRIMARY KEY,
+            id BIGINT,
             kode_organisasi TEXT NOT NULL,
             created_at TEXT NOT NULL,
             kelompok_usia TEXT,
@@ -104,8 +110,36 @@ def build_gabung():
     if not table_exists(SRC_TABLE):
         return
 
+    # Pastikan kolom sumber yang dibutuhkan ada (toleran: kalau tidak ada, treat 0)
+    src_cols = set(get_columns(SRC_TABLE))
+
+    # Nama kolom yang biasa ada pada sumber
+    ha_cols = ["ha_ringan", "ha_sedang", "ha_berat"]
+    hb_cols = ["hb_ringan", "hb_sedang", "hb_berat"]
+    other_cols = ["hemo_tipe_lain", "vwd_tipe1", "vwd_tipe2"]
+
+    def coalesce_or_zero(col: str) -> str:
+        # jika kolom ada, pakai COALESCE(kol,0), jika tidak, pakai literal 0
+        return f"COALESCE({col},0)" if col in src_cols else "0"
+
+    expr_ha = " + ".join(coalesce_or_zero(c) for c in ha_cols) or "0"
+    expr_hb = " + ".join(coalesce_or_zero(c) for c in hb_cols) or "0"
+    expr_hemo_lain = coalesce_or_zero("hemo_tipe_lain")
+    expr_vwd1 = coalesce_or_zero("vwd_tipe1")
+    expr_vwd2 = coalesce_or_zero("vwd_tipe2")
+
+    # Field ID/Kode/Created/Usia: kalau tidak ada di sumber, isi NULL/konstanta aman
+    id_expr = "id" if "id" in src_cols else "NULL"
+    kode_expr = "kode_organisasi" if "kode_organisasi" in src_cols else "NULL"
+    created_expr = "created_at" if "created_at" in src_cols else f"'{datetime.utcnow().strftime('%Y-%m-%d')}'"
+    usia_expr = "kelompok_usia" if "kelompok_usia" in src_cols else "NULL"
+
     # Bersihkan isi agar selalu sesuai sumber terbaru
-    exec_sql(f"DELETE FROM {DST_TABLE}")
+    # (TRUNCATE lebih cepat, tapi DELETE kompatibel lintas DB)
+    try:
+        exec_sql(f"TRUNCATE TABLE {DST_TABLE}")
+    except Exception:
+        exec_sql(f"DELETE FROM {DST_TABLE}")
 
     # Insert dari sumber dengan penjumlahan & COALESCE agar NULL jadi 0
     exec_sql(text(f"""
@@ -114,15 +148,15 @@ def build_gabung():
             hemo_a, hemo_b, hemo_tipe_lain, vwd_tipe1, vwd_tipe2
         )
         SELECT
-            id,
-            kode_organisasi,
-            created_at,
-            kelompok_usia,
-            COALESCE(ha_ringan,0) + COALESCE(ha_sedang,0) + COALESCE(ha_berat,0)     AS hemo_a,
-            COALESCE(hb_ringan,0) + COALESCE(hb_sedang,0) + COALESCE(hb_berat,0)     AS hemo_b,
-            COALESCE(hemo_tipe_lain,0)                                              AS hemo_tipe_lain,
-            COALESCE(vwd_tipe1,0)                                                   AS vwd_tipe1,
-            COALESCE(vwd_tipe2,0)                                                   AS vwd_tipe2
+            {id_expr} AS id,
+            {kode_expr} AS kode_organisasi,
+            {created_expr} AS created_at,
+            {usia_expr} AS kelompok_usia,
+            ({expr_ha})     AS hemo_a,
+            ({expr_hb})     AS hemo_b,
+            ({expr_hemo_lain}) AS hemo_tipe_lain,
+            ({expr_vwd1})   AS vwd_tipe1,
+            ({expr_vwd2})   AS vwd_tipe2
         FROM {SRC_TABLE}
     """))
 
@@ -280,14 +314,30 @@ def upload_excel_to_db(df_upload: pd.DataFrame):
 
 # ======================== Main ========================
 def main():
+    # Info koneksi singkat
+    p = ping()
+    if not p.get("ok"):
+        st.error("Database belum siap.")
+        st.code(p, language="json")
+        st.stop()
+
     df_disp = pd.DataFrame()
     df_raw = pd.DataFrame()
 
     # Bangun/refresh tabel gabung dari sumber (jika ada)
-    build_gabung()
-    df_raw = load_with_join()
-    if df_raw is not None and not df_raw.empty:
-        df_disp = apply_display_alias(df_raw.copy())
+    try:
+        build_gabung()
+    except Exception as e:
+        st.error("Gagal membangun tabel gabungan dari sumber.")
+        st.exception(e)
+
+    try:
+        df_raw = load_with_join()
+        if df_raw is not None and not df_raw.empty:
+            df_disp = apply_display_alias(df_raw.copy())
+    except Exception as e:
+        st.error("Gagal memuat data gabungan.")
+        st.exception(e)
 
     # --------- Toolbar Unduh / Unggah ----------
     st.subheader("⬇️ Unduh / ⬆️ Unggah Excel")
@@ -351,7 +401,9 @@ def main():
     else:
         dat = df_raw.copy()
         dat["kelompok_usia"] = (
-            dat["kelompok_usia"].astype(object).where(lambda s: ~s.isna(), KLP_LABEL_KOSONG).replace("None", KLP_LABEL_KOSONG)
+            dat["kelompok_usia"].astype(object)
+            .where(lambda s: ~s.isna(), KLP_LABEL_KOSONG)
+            .replace("None", KLP_LABEL_KOSONG)
         )
 
         def _to_date(x):
