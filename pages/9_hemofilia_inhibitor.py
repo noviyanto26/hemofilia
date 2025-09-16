@@ -1,13 +1,20 @@
-import streamlit as st
-import sqlite3
-import pandas as pd
-from datetime import datetime
 import io
+import sqlite3
+from datetime import datetime
+from pathlib import Path
 
+import pandas as pd
+import streamlit as st
+
+# =========================
+# Konfigurasi & Konstanta
+# =========================
 st.set_page_config(page_title="Jumlah Penyandang Hemofilia dengan Inhibitor", page_icon="🩸", layout="wide")
 st.title("🩸 Jumlah Penyandang Hemofilia dengan Inhibitor\n(Kasus sebelum 2024 dan masih mengidap hingga kini)")
 
-DB_PATH = "hemofilia.db"
+BASE_DIR = Path(__file__).resolve().parent
+DB_PATH = str((BASE_DIR / "hemofilia.db").resolve())
+
 TABLE = "hemofilia_inhibitor"
 
 # Baris input
@@ -38,7 +45,9 @@ ALIAS_TO_DB = {
 
 # ======================== Util DB ========================
 def connect():
-    return sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
 
 def _has_column(conn, table, col):
     cur = conn.cursor()
@@ -50,12 +59,30 @@ def _table_exists(conn, table):
     cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,))
     return cur.fetchone() is not None
 
+def _create_final_schema(conn, as_new: bool=False):
+    name = f"{TABLE}_new" if as_new else TABLE
+    conn.execute(f"""
+        CREATE TABLE IF NOT EXISTS {name} (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            kode_organisasi TEXT,
+            created_at TEXT NOT NULL,
+            label TEXT,
+            terdiagnosis_aktif INTEGER,
+            kasus_baru_2025 INTEGER,
+            penanganan INTEGER,
+            FOREIGN KEY (kode_organisasi) REFERENCES identitas_organisasi(kode_organisasi)
+        )
+    """)
+
 def migrate_if_needed():
-    """Pastikan skema final tersedia (termasuk kode_organisasi & kolom angka)."""
+    """Pastikan skema final tersedia (kode_organisasi, label, terdiagnosis_aktif, kasus_baru_2025, penanganan, created_at)."""
     with connect() as conn:
         if not _table_exists(conn, TABLE):
+            _create_final_schema(conn)
+            conn.commit()
             return
-        needed = ["kode_organisasi", "label", "terdiagnosis_aktif", "kasus_baru_2025", "penanganan"]
+
+        needed = ["kode_organisasi", "label", "terdiagnosis_aktif", "kasus_baru_2025", "penanganan", "created_at"]
         cur = conn.cursor()
         cur.execute(f"PRAGMA table_info({TABLE})")
         have = [r[1] for r in cur.fetchall()]
@@ -63,27 +90,28 @@ def migrate_if_needed():
             return
 
         st.warning("Migrasi skema: menyesuaikan tabel Hemofilia Inhibitor…")
-        cur = conn.cursor()
         cur.execute("PRAGMA foreign_keys=OFF")
         try:
-            cur.execute(f"""
-                CREATE TABLE IF NOT EXISTS {TABLE}_new (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    kode_organisasi TEXT,
-                    created_at TEXT NOT NULL,
-                    label TEXT,
-                    terdiagnosis_aktif INTEGER,
-                    kasus_baru_2025 INTEGER,
-                    penanganan INTEGER,
-                    FOREIGN KEY (kode_organisasi) REFERENCES identitas_organisasi(kode_organisasi)
-                )
-            """)
-            # Salin kolom yang ada saja (jika tabel lama ada)
+            _create_final_schema(conn, as_new=True)
+
             cur.execute(f"PRAGMA table_info({TABLE})")
-            old_cols = [r[1] for r in cur.fetchall() if r[1] != "id"]
-            if old_cols:
-                cols_csv = ", ".join(old_cols)
-                cur.execute(f"INSERT INTO {TABLE}_new ({cols_csv}) SELECT {cols_csv} FROM {TABLE}")
+            old_cols = [r[1] for r in cur.fetchall()]
+
+            # Susun SELECT untuk copy data lama → baru (isi NULL bila kolom lama belum ada)
+            select_parts = []
+            select_parts.append("id" if "id" in old_cols else "NULL AS id")
+            select_parts.append("kode_organisasi" if "kode_organisasi" in old_cols else "NULL AS kode_organisasi")
+            select_parts.append("created_at" if "created_at" in old_cols else "NULL AS created_at")
+            select_parts.append("label" if "label" in old_cols else "NULL AS label")
+            select_parts.append("terdiagnosis_aktif" if "terdiagnosis_aktif" in old_cols else "NULL AS terdiagnosis_aktif")
+            select_parts.append("kasus_baru_2025" if "kasus_baru_2025" in old_cols else "NULL AS kasus_baru_2025")
+            select_parts.append("penanganan" if "penanganan" in old_cols else "NULL AS penanganan")
+
+            select_sql = ", ".join(select_parts)
+            cur.execute(f"""
+                INSERT INTO {TABLE}_new (id, kode_organisasi, created_at, label, terdiagnosis_aktif, kasus_baru_2025, penanganan)
+                SELECT {select_sql} FROM {TABLE}
+            """)
             cur.execute(f"ALTER TABLE {TABLE} RENAME TO {TABLE}_backup")
             cur.execute(f"ALTER TABLE {TABLE}_new RENAME TO {TABLE}")
             conn.commit()
@@ -96,29 +124,12 @@ def migrate_if_needed():
 
 def init_db():
     with connect() as conn:
-        c = conn.cursor()
-        c.execute(f"""
-            CREATE TABLE IF NOT EXISTS {TABLE} (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                kode_organisasi TEXT,
-                created_at TEXT NOT NULL,
-                label TEXT,
-                terdiagnosis_aktif INTEGER,
-                kasus_baru_2025 INTEGER,
-                penanganan INTEGER,
-                FOREIGN KEY (kode_organisasi) REFERENCES identitas_organisasi(kode_organisasi)
-            )
-        """)
+        _create_final_schema(conn, as_new=False)
         conn.commit()
 
 # ======================== Helpers ========================
 def load_hmhi_to_kode():
-    """
-    Ambil pilihan dari identitas_organisasi.hmhi_cabang dan petakan ke kode_organisasi.
-    Return:
-        mapping: dict {hmhi_cabang -> kode_organisasi}
-        options: list hmhi_cabang (urut alfabet)
-    """
+    """Map identitas_organisasi.hmhi_cabang → kode_organisasi."""
     with connect() as conn:
         try:
             df = pd.read_sql_query(
@@ -133,17 +144,16 @@ def load_hmhi_to_kode():
                 kode_val = (str(row["kode_organisasi"]).strip() if pd.notna(row["kode_organisasi"]) else "")
                 if hmhi_val:
                     mapping[hmhi_val] = kode_val
-            options = sorted(mapping.keys())
-            return mapping, options
+            return mapping, sorted(mapping.keys())
         except Exception:
             return {}, []
 
-def safe_int(val):
+def _to_nonneg_int(val):
     try:
         x = pd.to_numeric(val, errors="coerce")
         if pd.isna(x):
             return 0
-        return int(x)
+        return max(int(x), 0)
     except Exception:
         return 0
 
@@ -159,7 +169,7 @@ def insert_row(payload: dict, kode_organisasi: str):
         )
         conn.commit()
 
-def read_with_kota(limit=500):
+def read_with_join(limit=500):
     with connect() as conn:
         if not _has_column(conn, TABLE, "kode_organisasi"):
             st.error("Kolom 'kode_organisasi' belum tersedia. Coba refresh setelah migrasi.")
@@ -175,7 +185,8 @@ def read_with_kota(limit=500):
             LEFT JOIN identitas_organisasi io ON io.kode_organisasi = t.kode_organisasi
             ORDER BY t.id DESC
             LIMIT ?
-            """, conn, params=[limit]
+            """,
+            conn, params=[limit]
         )
 
 # ======================== Startup ========================
@@ -186,7 +197,7 @@ init_db()
 tab_input, tab_data = st.tabs(["📝 Input", "📄 Data"])
 
 with tab_input:
-    # 🔁 Pilihan dari HMHI cabang → dipetakan ke kode_organisasi
+    # 🔁 HMHI cabang → kode_organisasi
     hmhi_map, hmhi_list = load_hmhi_to_kode()
     if not hmhi_list:
         st.warning("Belum ada data Identitas Organisasi (kolom HMHI cabang).")
@@ -198,7 +209,7 @@ with tab_input:
             key="inhib::hmhi_select"
         )
 
-    # Template editor
+    # Editor
     df_default = pd.DataFrame(0, index=ROW_LABELS, columns=[c for c, _ in COLS])
     df_default.index.name = "Jenis Hemofilia"
 
@@ -226,20 +237,24 @@ with tab_input:
             if not kode_organisasi:
                 st.error("Kode organisasi tidak ditemukan untuk HMHI cabang terpilih.")
             else:
+                rows_saved = 0
                 for label in ROW_LABELS:
                     payload = {
                         "label": label,
-                        "terdiagnosis_aktif": safe_int(edited.loc[label, "terdiagnosis_aktif"]),
-                        "kasus_baru_2025": safe_int(edited.loc[label, "kasus_baru_2025"]),
-                        "penanganan": safe_int(edited.loc[label, "penanganan"]),
+                        "terdiagnosis_aktif": _to_nonneg_int(edited.loc[label, "terdiagnosis_aktif"]),
+                        "kasus_baru_2025": _to_nonneg_int(edited.loc[label, "kasus_baru_2025"]),
+                        "penanganan": _to_nonneg_int(edited.loc[label, "penanganan"]),
                     }
-                    insert_row(payload, kode_organisasi)
-                st.success(f"Data berhasil disimpan untuk **{selected_hmhi}**.")
+                    # simpan hanya jika ada angka > 0 agar tidak membanjiri data nol
+                    if any(payload[k] > 0 for k, _ in COLS):
+                        insert_row(payload, kode_organisasi)
+                        rows_saved += 1
+                st.success(f"{rows_saved} baris berhasil disimpan untuk **{selected_hmhi}**.")
 
 # ======================== Data Tersimpan & Unggah Excel ========================
 with tab_data:
     st.subheader("📄 Data Tersimpan")
-    df = read_with_kota(limit=500)
+    df = read_with_join(limit=500)
 
     # ===== Unduh Template Excel =====
     st.caption("Gunakan template berikut saat mengunggah data (kolom harus sesuai).")
@@ -263,8 +278,10 @@ with tab_data:
     if df.empty:
         st.info("Belum ada data.")
     else:
-        cols_order = ["hmhi_cabang", "kota_cakupan_cabang", "created_at", "label",
-                      "terdiagnosis_aktif", "kasus_baru_2025", "penanganan"]
+        cols_order = [
+            "hmhi_cabang", "kota_cakupan_cabang", "created_at", "label",
+            "terdiagnosis_aktif", "kasus_baru_2025", "penanganan"
+        ]
         cols_order = [c for c in cols_order if c in df.columns]
         view = df[cols_order].rename(columns={
             "hmhi_cabang": "HMHI cabang",
@@ -323,7 +340,7 @@ with tab_data:
 
             for i in range(len(df_up)):
                 try:
-                    s = df_up.iloc[i]  # pandas.Series (hindari error tuple)
+                    s = df_up.iloc[i]  # pandas.Series
                     hmhi = str((s.get("hmhi_cabang_info") or "")).strip()
                     if not hmhi:
                         raise ValueError("Kolom 'HMHI cabang' kosong.")
@@ -337,9 +354,9 @@ with tab_data:
 
                     payload = {
                         "label": label,
-                        "terdiagnosis_aktif": safe_int(s.get("terdiagnosis_aktif")),
-                        "kasus_baru_2025": safe_int(s.get("kasus_baru_2025")),
-                        "penanganan": safe_int(s.get("penanganan")),
+                        "terdiagnosis_aktif": _to_nonneg_int(s.get("terdiagnosis_aktif")),
+                        "kasus_baru_2025": _to_nonneg_int(s.get("kasus_baru_2025")),
+                        "penanganan": _to_nonneg_int(s.get("penanganan")),
                     }
                     insert_row(payload, kode_organisasi)
                     results.append({"Baris Excel": i + 2, "Status": "OK", "Keterangan": f"Simpan → {hmhi} / {label}"})
