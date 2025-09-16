@@ -9,15 +9,13 @@ import streamlit as st
 # =========================
 # Konfigurasi & Konstanta
 # =========================
-st.set_page_config(page_title="Pasien Nonfaktor (Disatukan)", page_icon="🩸", layout="wide")
+st.set_page_config(page_title="Pasien Nonfaktor (Satu Tabel)", page_icon="🩸", layout="wide")
 st.title("🩸 Pasien Pengguna Nonfaktor — Total Dengan & Tanpa Inhibitor (Satu Tabel)")
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = str((BASE_DIR / "hemofilia.db").resolve())
 
-TABLE = "pasien_nonfaktor"   # disatukan
-LEGACY_INHIB = "pasien_nonfaktor_inhibitor"       # opsional (lama)
-LEGACY_TANPA = "pasien_nonfaktor_tanpa_inhibitor" # opsional (lama)
+TABLE = "pasien_nonfaktor"   # skema tunggal
 
 TEMPLATE_COLUMNS = ["HMHI cabang", "Dengan inhibitor", "Tanpa inhibitor"]
 ALIAS_TO_DB = {
@@ -42,119 +40,17 @@ def _has_column(conn, table, col):
     cur.execute(f"PRAGMA table_info({table})")
     return any((r[1] == col) for r in cur.fetchall())
 
-def create_main_schema(conn, as_new=False):
-    name = f"{TABLE}_new" if as_new else TABLE
+def create_main_schema(conn):
     conn.execute(f"""
-        CREATE TABLE IF NOT EXISTS {name} (
+        CREATE TABLE IF NOT EXISTS {TABLE} (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             kode_organisasi TEXT,
             created_at TEXT NOT NULL,
             dengan_inhibitor INTEGER NOT NULL DEFAULT 0,
-            tanpa_inhibitor INTEGER NOT NULL DEFAULT 0,
+            tanpa_inhibitor  INTEGER NOT NULL DEFAULT 0,
             FOREIGN KEY (kode_organisasi) REFERENCES identitas_organisasi(kode_organisasi)
         )
     """)
-
-def migrate_if_needed():
-    with connect() as conn:
-        if not _table_exists(conn, TABLE):
-            create_main_schema(conn)
-            conn.commit()
-            return
-
-        need = ["kode_organisasi", "created_at", "dengan_inhibitor", "tanpa_inhibitor"]
-        cur = conn.cursor()
-        cur.execute(f"PRAGMA table_info({TABLE})")
-        have = [r[1] for r in cur.fetchall()]
-        if all(c in have for c in need):
-            return
-
-        st.warning("Migrasi skema: menyesuaikan tabel pasien_nonfaktor …")
-        try:
-            conn.execute("PRAGMA foreign_keys=OFF")
-            create_main_schema(conn, as_new=True)
-
-            # copy kolom yang ada
-            cur.execute(f"PRAGMA table_info({TABLE})")
-            old_cols = [r[1] for r in cur.fetchall()]
-            sel = []
-            sel.append("id" if "id" in old_cols else "NULL AS id")
-            sel.append("kode_organisasi" if "kode_organisasi" in old_cols else "NULL AS kode_organisasi")
-            sel.append("created_at" if "created_at" in old_cols else f"'{datetime.utcnow().isoformat()}' AS created_at")
-            sel.append("dengan_inhibitor" if "dengan_inhibitor" in old_cols else "0 AS dengan_inhibitor")
-            sel.append("tanpa_inhibitor" if "tanpa_inhibitor" in old_cols else "0 AS tanpa_inhibitor")
-            select_sql = ", ".join(sel)
-            conn.execute(f"""
-                INSERT INTO {TABLE}_new (id, kode_organisasi, created_at, dengan_inhibitor, tanpa_inhibitor)
-                SELECT {select_sql} FROM {TABLE}
-            """)
-            conn.execute(f"ALTER TABLE {TABLE} RENAME TO {TABLE}_backup")
-            conn.execute(f"ALTER TABLE {TABLE}_new RENAME TO {TABLE}")
-            conn.commit()
-            st.success("Migrasi selesai. Tabel lama disimpan sebagai _backup.")
-        except Exception as e:
-            conn.rollback()
-            st.error(f"Migrasi gagal: {e}")
-        finally:
-            conn.execute("PRAGMA foreign_keys=ON")
-
-def migrate_from_legacy_tables():
-    """
-    OPSIONAL: Jika masih ada tabel lama:
-    - pasien_nonfaktor_inhibitor(jenis_penanganan, ketersediaan, jumlah_pengguna)
-    - pasien_nonfaktor_tanpa_inhibitor(jenis_penanganan, ketersediaan, jumlah_pengguna)
-    Maka fungsi ini akan mengagregasi jumlah_pengguna per (kode_organisasi, created_at persis)
-    lalu memasukkan totalnya ke tabel utama pasien_nonfaktor.
-    """
-    with connect() as conn:
-        if not (_table_exists(conn, LEGACY_INHIB) or _table_exists(conn, LEGACY_TANPA)):
-            return  # tidak ada tabel lama
-
-        st.info("Ditemukan tabel lama. Menjalankan migrasi agregasi ke tabel utama…")
-        create_main_schema(conn)  # pastikan ada
-
-        # siapkan subquery dengan aman (jika tabel tidak ada → nol baris)
-        inhib_q = (f"""
-            SELECT kode_organisasi, created_at, SUM(COALESCE(jumlah_pengguna,0)) AS total_inhib
-            FROM {LEGACY_INHIB}
-            GROUP BY kode_organisasi, created_at
-        """) if _table_exists(conn, LEGACY_INHIB) else "SELECT NULL AS kode_organisasi, NULL AS created_at, 0 AS total_inhib WHERE 0"
-        tanpa_q = (f"""
-            SELECT kode_organisasi, created_at, SUM(COALESCE(jumlah_pengguna,0)) AS total_tanpa
-            FROM {LEGACY_TANPA}
-            GROUP BY kode_organisasi, created_at
-        """) if _table_exists(conn, LEGACY_TANPA) else "SELECT NULL AS kode_organisasi, NULL AS created_at, 0 AS total_tanpa WHERE 0"
-
-        # gabung penuh sederhana dengan UNION lalu agregasi (menangani mismatch created_at)
-        df_agg = pd.read_sql_query(f"""
-            WITH a AS ({inhib_q}),
-                 b AS ({tanpa_q})
-            SELECT COALESCE(a.kode_organisasi, b.kode_organisasi) AS kode_organisasi,
-                   COALESCE(a.created_at, b.created_at) AS created_at,
-                   COALESCE(a.total_inhib, 0) AS total_inhib,
-                   COALESCE(b.total_tanpa, 0) AS total_tanpa
-            FROM a
-            FULL OUTER JOIN b
-            ON a.kode_organisasi = b.kode_organisasi AND a.created_at = b.created_at
-        """, conn)
-
-        if df_agg.empty:
-            st.info("Tidak ada data yang perlu dimigrasikan dari tabel lama.")
-            return
-
-        # insert ke tabel utama
-        cur = conn.cursor()
-        for _, r in df_agg.iterrows():
-            kode = r["kode_organisasi"]
-            created_at = r["created_at"] or datetime.utcnow().isoformat()
-            di = int(r.get("total_inhib") or 0)
-            ti = int(r.get("total_tanpa") or 0)
-            cur.execute(
-                f"INSERT INTO {TABLE} (kode_organisasi, created_at, dengan_inhibitor, tanpa_inhibitor) VALUES (?, ?, ?, ?)",
-                [kode, str(created_at), di, ti]
-            )
-        conn.commit()
-        st.success(f"Migrasi agregasi selesai: {len(df_agg)} baris dipindahkan ke {TABLE}.")
 
 def init_db():
     with connect() as conn:
@@ -163,6 +59,7 @@ def init_db():
 
 # ======================== Helpers ========================
 def load_hmhi_to_kode():
+    """Map hmhi_cabang -> kode_organisasi dari identitas_organisasi."""
     with connect() as conn:
         try:
             df = pd.read_sql_query(
@@ -172,7 +69,8 @@ def load_hmhi_to_kode():
             if df.empty:
                 return {}, []
             mapping = {str(r["hmhi_cabang"]).strip(): str(r["kode_organisasi"]).strip()
-                       for _, r in df.iterrows() if pd.notna(r["hmhi_cabang"]) and str(r["hmhi_cabang"]).strip()}
+                       for _, r in df.iterrows()
+                       if pd.notna(r["hmhi_cabang"]) and str(r["hmhi_cabang"]).strip()}
             return mapping, sorted(mapping.keys())
         except Exception:
             return {}, []
@@ -197,7 +95,7 @@ def insert_row(kode_organisasi: str, di: int, ti: int):
 def read_with_join(limit=500):
     with connect() as conn:
         if not _has_column(conn, TABLE, "kode_organisasi"):
-            st.error("Kolom 'kode_organisasi' belum tersedia. Coba refresh setelah migrasi.")
+            st.error("Kolom 'kode_organisasi' belum tersedia. Coba refresh setelah inisialisasi.")
             return pd.read_sql_query(f"SELECT * FROM {TABLE} ORDER BY id DESC LIMIT ?", conn, params=[limit])
         return pd.read_sql_query(
             f"""
@@ -212,10 +110,7 @@ def read_with_join(limit=500):
         )
 
 # ======================== Startup ========================
-migrate_if_needed()
 init_db()
-# Jalankan sekali untuk migrasi dari tabel lama (abaikan jika tidak ada)
-migrate_from_legacy_tables()
 
 # ======================== UI ========================
 tab_input, tab_data = st.tabs(["📝 Input", "📄 Data"])
