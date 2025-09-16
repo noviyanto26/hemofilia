@@ -1,25 +1,14 @@
 import streamlit as st
 import pandas as pd
-from datetime import datetime
 import io
-from sqlalchemy import create_engine, text
 
 # ======================== Konfigurasi Halaman ========================
 st.set_page_config(page_title="Replacement Therapy", page_icon="🧪", layout="wide")
 st.title("🧪 Ketersediaan Produk Replacement Therapy")
 
-# ======================== Koneksi Database (Postgres) ========================
-# Gunakan secrets seperti referensi sebelumnya
-DB_URL = st.secrets["database"]["url"]
-engine = create_engine(DB_URL, pool_pre_ping=True, pool_recycle=300)
-
-def fetch_df(sql: str, params: dict | None = None) -> pd.DataFrame:
-    with engine.begin() as conn:
-        return pd.read_sql_query(text(sql), conn, params=params)
-
-def exec_sql(sql: str, params: dict | None = None) -> None:
-    with engine.begin() as conn:
-        conn.execute(text(sql), params or {})
+# ======================== Koneksi DB (pakai helper seperti referensi) ========================
+# Mengikuti pola file referensi: import helper dari db.py
+from db import fetch_df as pg_fetch_df, exec_sql as pg_exec_sql  # <- sama seperti file "Identitas Organisasi"
 
 # ======================== Konstanta Tabel ========================
 TABLE = "public.ketersediaan_produk_replacement"
@@ -51,7 +40,7 @@ def insert_row(table_name: str, payload: dict, kode_organisasi: str):
         "jumlah_iu_per_kemasan": int(payload.get("jumlah_iu_per_kemasan") or 0),
         "harga": float(payload.get("harga") or 0.0),
     }
-    exec_sql(sql, params)
+    pg_exec_sql(sql, params)
 
 def read_with_kota(table_name: str, limit=1000):
     """
@@ -68,7 +57,7 @@ def read_with_kota(table_name: str, limit=1000):
         ORDER BY t.id DESC
         LIMIT :lim
     """
-    return fetch_df(sql, params={"lim": int(limit)})
+    return pg_fetch_df(sql, {"lim": int(limit)})
 
 # ======================== Helpers UI/Input ========================
 def load_hmhi_to_kode():
@@ -79,7 +68,7 @@ def load_hmhi_to_kode():
         options: list hmhi_cabang (urut alfabet)
     """
     try:
-        df = fetch_df(
+        df = pg_fetch_df(
             f"SELECT hmhi_cabang, kode_organisasi FROM {TABLE_ORG} "
             "WHERE hmhi_cabang IS NOT NULL AND hmhi_cabang <> '' "
             "ORDER BY id DESC"
