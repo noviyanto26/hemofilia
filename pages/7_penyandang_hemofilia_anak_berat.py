@@ -1,16 +1,24 @@
-import streamlit as st
-import sqlite3
-import pandas as pd
-from datetime import datetime
 import io
+import sqlite3
+from datetime import datetime
+from pathlib import Path
 
+import pandas as pd
+import streamlit as st
+
+# =========================
+# Konfigurasi & Konstanta
+# =========================
 st.set_page_config(page_title="Penyandang Hemofilia Anak (Berat)", page_icon="🩸", layout="wide")
 st.title("🩸 Penyandang Hemofilia Anak (Di bawah 18 Tahun) — Tingkat Berat (<1%)")
 
-DB_PATH = "hemofilia.db"
-TABLE = "anak_hemofilia_berat"
+BASE_DIR = Path(__file__).resolve().parent
+DB_PATH = str((BASE_DIR / "hemofilia.db").resolve())
 
-# Baris yang diisi user (tanpa Total) — untuk input manual
+# Samakan dengan nama tabel di skema DB kamu
+TABLE = "penyandang_hemofilia_anak_berat"
+
+# Baris input manual (tanpa Total)
 ROW_LABELS = [
     "Hemofilia A Laki-laki",
     "Hemofilia A Perempuan",
@@ -22,7 +30,7 @@ TOTAL_LABEL = "Total"
 # ===== Template unggah & alias =====
 TEMPLATE_COLUMNS = [
     "HMHI cabang",
-    "Kategori",          # ganti dari "Baris" menjadi "Kategori"
+    "Kategori",
     "Berat (<1%)",
 ]
 ALIAS_TO_DB = {
@@ -33,7 +41,9 @@ ALIAS_TO_DB = {
 
 # ================== Helper DB ==================
 def connect():
-    return sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
 
 def _has_column(conn, table, col):
     cur = conn.cursor()
@@ -45,44 +55,61 @@ def _table_exists(conn, table):
     cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,))
     return cur.fetchone() is not None
 
+def _create_final_schema(conn, as_new: bool=False):
+    name = f"{TABLE}_new" if as_new else TABLE
+    conn.execute(f"""
+        CREATE TABLE IF NOT EXISTS {name} (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            kode_organisasi TEXT,
+            created_at TEXT NOT NULL,
+            kategori TEXT,
+            berat INTEGER,
+            is_total_row TEXT,
+            FOREIGN KEY (kode_organisasi) REFERENCES identitas_organisasi(kode_organisasi)
+        )
+    """)
+
 def migrate_if_needed():
     """
-    Pastikan skema final tersedia dan kolom 'label' diganti menjadi 'kategori'.
+    Pastikan skema final tersedia dan kolom 'label' (jika ada) dimigrasikan menjadi 'kategori'.
     Skema final: id, kode_organisasi, created_at, kategori, berat, is_total_row
     """
     with connect() as conn:
+        # Jika tabel belum ada → buat dengan skema final
         if not _table_exists(conn, TABLE):
-            # buat tabel baru langsung dengan skema final
             _create_final_schema(conn)
             conn.commit()
             return
 
-        # Jika sudah ada 'kategori' dan kolom lain, tidak perlu migrasi
-        needed = ["kode_organisasi", "kategori", "berat", "is_total_row"]
+        needed = ["kode_organisasi", "kategori", "berat", "is_total_row", "created_at"]
         cur = conn.cursor()
         cur.execute(f"PRAGMA table_info({TABLE})")
         have = [r[1] for r in cur.fetchall()]
         if all(col in have for col in needed):
             return
 
-        st.warning("Migrasi skema tabel Anak Hemofilia Berat (ganti 'label' ➜ 'kategori')…")
+        st.warning("Migrasi skema: menyesuaikan tabel Penyandang Hemofilia Anak (Berat)…")
         cur.execute("PRAGMA foreign_keys=OFF")
         try:
-            # Buat tabel baru dg kolom final
+            # Buat tabel baru dengan skema final
             _create_final_schema(conn, as_new=True)
-            # Tentukan kolom-kolom yang bisa dicopy
+
+            # Ambil kolom lama
             cur.execute(f"PRAGMA table_info({TABLE})")
             old_cols = [r[1] for r in cur.fetchall()]
 
-            # Siapkan SELECT dengan pemetaan label->kategori bila kolom label ada
+            # Susun SELECT untuk copy data lama → baru
             select_parts = []
+            # id
             if "id" in old_cols:
                 select_parts.append("id")
+            else:
+                select_parts.append("NULL AS id")
             # kode_organisasi
             select_parts.append("kode_organisasi" if "kode_organisasi" in old_cols else "NULL AS kode_organisasi")
             # created_at
             select_parts.append("created_at" if "created_at" in old_cols else "NULL AS created_at")
-            # kategori: ambil dari 'kategori' jika sudah ada; jika belum, pakai 'label'
+            # kategori (prioritas pakai 'kategori', fallback 'label')
             if "kategori" in old_cols:
                 select_parts.append("kategori")
             elif "label" in old_cols:
@@ -109,20 +136,6 @@ def migrate_if_needed():
             st.error(f"Migrasi gagal: {e}")
         finally:
             cur.execute("PRAGMA foreign_keys=ON")
-
-def _create_final_schema(conn, as_new: bool=False):
-    name = f"{TABLE}_new" if as_new else TABLE
-    conn.execute(f"""
-        CREATE TABLE IF NOT EXISTS {name} (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            kode_organisasi TEXT,
-            created_at TEXT NOT NULL,
-            kategori TEXT,
-            berat INTEGER,
-            is_total_row TEXT,
-            FOREIGN KEY (kode_organisasi) REFERENCES identitas_organisasi(kode_organisasi)
-        )
-    """)
 
 def init_db():
     with connect() as conn:
@@ -156,12 +169,12 @@ def load_hmhi_to_kode():
         except Exception:
             return {}, []
 
-def safe_int(val):
+def _to_nonneg_int(v):
     try:
-        x = pd.to_numeric(val, errors="coerce")
+        x = pd.to_numeric(v, errors="coerce")
         if pd.isna(x):
             return 0
-        return int(x)
+        return max(int(x), 0)
     except Exception:
         return 0
 
@@ -177,9 +190,8 @@ def insert_row(payload: dict, kode_organisasi: str):
         )
         conn.commit()
 
-def read_with_kota(limit=500):
+def read_with_join(limit=500):
     with connect() as conn:
-        # pastikan kolom kategori sudah ada (pasca migrasi)
         if not _has_column(conn, TABLE, "kode_organisasi"):
             st.error("Kolom 'kode_organisasi' belum tersedia. Coba refresh setelah migrasi.")
             return pd.read_sql_query(f"SELECT * FROM {TABLE} ORDER BY id DESC LIMIT ?", conn, params=[limit])
@@ -193,7 +205,8 @@ def read_with_kota(limit=500):
             LEFT JOIN identitas_organisasi io ON io.kode_organisasi = t.kode_organisasi
             ORDER BY t.id DESC
             LIMIT ?
-            """, conn, params=[limit]
+            """,
+            conn, params=[limit]
         )
 
 # ================== Startup ==================
@@ -241,28 +254,24 @@ with tab_input:
                 st.error("Kode organisasi tidak ditemukan untuk HMHI cabang terpilih.")
             else:
                 total_val = 0
+                rows_saved = 0
                 # Simpan 4 baris utama
                 for kategori in ROW_LABELS:
-                    val = safe_int(edited.loc[kategori, "berat"])
+                    val = _to_nonneg_int(edited.loc[kategori, "berat"])
                     total_val += val
-                    payload = {
-                        "kategori": kategori,
-                        "berat": val,
-                        "is_total_row": "0",
-                    }
-                    insert_row(payload, kode_organisasi)
+                    payload = {"kategori": kategori, "berat": val, "is_total_row": "0"}
+                    # Simpan jika >0 agar tidak menambah baris kosong
+                    if val > 0:
+                        insert_row(payload, kode_organisasi)
+                        rows_saved += 1
                 # Tambah baris Total otomatis
-                payload = {
-                    "kategori": TOTAL_LABEL,
-                    "berat": total_val,
-                    "is_total_row": "1",
-                }
-                insert_row(payload, kode_organisasi)
-                st.success(f"Data berhasil disimpan untuk **{selected_hmhi}**.")
+                insert_row({"kategori": TOTAL_LABEL, "berat": total_val, "is_total_row": "1"}, kode_organisasi)
+                rows_saved += 1
+                st.success(f"{rows_saved} baris berhasil disimpan untuk **{selected_hmhi}**.")
 
 with tab_data:
     st.subheader("📄 Data Tersimpan")
-    df = read_with_kota(limit=500)
+    df = read_with_join(limit=500)
 
     # ===== Unduh Template Excel =====
     st.caption("Gunakan template berikut saat mengunggah data (kolom harus sesuai).")
@@ -299,7 +308,7 @@ with tab_data:
             "berat": "Berat (<1%)",
         })
 
-        # Pastikan "Total" di bawah untuk setiap batch input (Created At terbaru di atas)
+        # Pastikan "Total" muncul di bawah dalam batch yang sama (Created At turun)
         if "Kategori" in view.columns:
             view["__is_total__"] = view["Kategori"].astype(str).str.strip().eq(TOTAL_LABEL).astype(int)
             view = view.sort_values(by=["Created At", "__is_total__"], ascending=[False, True]).drop(columns="__is_total__")
@@ -352,7 +361,7 @@ with tab_data:
 
             for i in range(len(df_up)):
                 try:
-                    s = df_up.iloc[i]  # pandas.Series
+                    s = df_up.iloc[i]
                     hmhi = str((s.get("hmhi_cabang_info") or "")).strip()
                     if not hmhi:
                         raise ValueError("Kolom 'HMHI cabang' kosong.")
@@ -364,10 +373,10 @@ with tab_data:
                     if not kategori:
                         raise ValueError("Kolom 'Kategori' kosong.")
 
-                    berat_val = safe_int(s.get("berat"))
+                    berat_val = _to_nonneg_int(s.get("berat"))
                     payload = {
                         "kategori": kategori,
-                        "berat": max(berat_val, 0),
+                        "berat": berat_val,
                         "is_total_row": "1" if kategori.strip().lower() == TOTAL_LABEL.lower() else "0",
                     }
                     insert_row(payload, kode_organisasi)
