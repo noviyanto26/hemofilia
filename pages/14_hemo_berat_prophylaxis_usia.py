@@ -1,173 +1,18 @@
 import streamlit as st
-import sqlite3
 import pandas as pd
-from datetime import datetime
 import io
 
-# ======================== Konfigurasi Halaman ========================
 st.set_page_config(page_title="Hemofilia Berat - Prophylaxis per Usia", page_icon="📊", layout="wide")
 st.title("📊 Persentase Penyandang Hemofilia Berat dengan Prophylaxis Berdasarkan Usia")
 
-DB_PATH = "hemofilia.db"
-TABLE = "hemo_berat_prophylaxis_usia"
+# ====== Target tabel di Postgres (Supabase) ======
+SUPABASE_TABLE = "public.hemo_berat_prophylaxis_usia"
+IDENT_TABLE    = "public.identitas_organisasi"
 
-# ======================== Util DB umum ========================
-def connect():
-    return sqlite3.connect(DB_PATH)
+# Konektor Postgres yang sama seperti referensi (db.py)
+from db import fetch_df as pg_fetch_df, exec_sql as pg_exec_sql
 
-def _table_exists(conn, table):
-    cur = conn.cursor()
-    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,))
-    return cur.fetchone() is not None
-
-def _has_column(conn, table, col):
-    cur = conn.cursor()
-    cur.execute(f"PRAGMA table_info({table})")
-    return any((row[1] == col) for row in cur.fetchall())
-
-def migrate_if_needed(table_name: str):
-    """
-    Pastikan skema final tersedia.
-    Skema final:
-      id, kode_organisasi, created_at,
-      jenis, persen_0_18, persen_gt_18, frekuensi, produk,
-      tidak_ada_data, dosis_per_kedatangan, estimasi_data_real
-    """
-    with connect() as conn:
-        cur = conn.cursor()
-        if not _table_exists(conn, table_name):
-            return
-        needed = [
-            "kode_organisasi","jenis","persen_0_18","persen_gt_18","frekuensi",
-            "produk","tidak_ada_data","dosis_per_kedatangan","estimasi_data_real",
-        ]
-        cur.execute(f"PRAGMA table_info({table_name})")
-        have = [r[1] for r in cur.fetchall()]
-        if all(col in have for col in needed):
-            return
-
-        st.warning(f"Migrasi skema: menyesuaikan tabel {table_name} …")
-        cur.execute("PRAGMA foreign_keys=OFF")
-        try:
-            cur.execute(f"""
-                CREATE TABLE IF NOT EXISTS {table_name}_new (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    kode_organisasi TEXT,
-                    created_at TEXT NOT NULL,
-                    jenis TEXT,
-                    persen_0_18 REAL,
-                    persen_gt_18 REAL,
-                    frekuensi TEXT,
-                    produk TEXT,
-                    tidak_ada_data TEXT,
-                    dosis_per_kedatangan REAL,
-                    estimasi_data_real TEXT,
-                    FOREIGN KEY (kode_organisasi) REFERENCES identitas_organisasi(kode_organisasi)
-                )
-            """)
-            cur.execute(f"PRAGMA table_info({table_name})")
-            old_cols = [r[1] for r in cur.fetchall() if r[1] != "id"]
-            if old_cols:
-                cols_csv = ", ".join(old_cols)
-                cur.execute(f"INSERT INTO {table_name}_new ({cols_csv}) SELECT {cols_csv} FROM {table_name}")
-            cur.execute(f"ALTER TABLE {table_name} RENAME TO {table_name}_backup")
-            cur.execute(f"ALTER TABLE {table_name}_new RENAME TO {table_name}")
-            conn.commit()
-            st.success(f"Migrasi {table_name} selesai. Tabel lama disimpan sebagai _backup.")
-        except Exception as e:
-            conn.rollback()
-            st.error(f"Migrasi {table_name} gagal: {e}")
-        finally:
-            cur.execute("PRAGMA foreign_keys=ON")
-
-def init_db(table_name: str):
-    with connect() as conn:
-        c = conn.cursor()
-        c.execute(f"""
-            CREATE TABLE IF NOT EXISTS {table_name} (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                kode_organisasi TEXT,
-                created_at TEXT NOT NULL,
-                jenis TEXT,
-                persen_0_18 REAL,
-                persen_gt_18 REAL,
-                frekuensi TEXT,
-                produk TEXT,
-                tidak_ada_data TEXT,
-                dosis_per_kedatangan REAL,
-                estimasi_data_real TEXT,
-                FOREIGN KEY (kode_organisasi) REFERENCES identitas_organisasi(kode_organisasi)
-            )
-        """)
-        conn.commit()
-
-def insert_row(table_name: str, payload: dict, kode_organisasi: str):
-    with connect() as conn:
-        c = conn.cursor()
-        cols = ", ".join(payload.keys())
-        placeholders = ", ".join(["?"] * len(payload))
-        vals = [payload[k] for k in payload]
-        c.execute(
-            f"INSERT INTO {table_name} (kode_organisasi, created_at, {cols}) VALUES (?, ?, {placeholders})",
-            [kode_organisasi, datetime.utcnow().isoformat()] + vals
-        )
-        conn.commit()
-
-def read_with_kota(table_name: str, limit=1000):
-    with connect() as conn:
-        if not _has_column(conn, table_name, "kode_organisasi"):
-            st.error(f"Kolom 'kode_organisasi' belum tersedia di {table_name}. Coba refresh setelah migrasi.")
-            return pd.read_sql_query(f"SELECT * FROM {table_name} ORDER BY id DESC LIMIT ?", conn, params=[limit])
-
-        return pd.read_sql_query(
-            f"""
-            SELECT
-              t.id, t.kode_organisasi, t.created_at,
-              t.jenis, t.persen_0_18, t.persen_gt_18, t.frekuensi,
-              t.produk, t.tidak_ada_data, t.dosis_per_kedatangan, t.estimasi_data_real,
-              io.hmhi_cabang, io.kota_cakupan_cabang
-            FROM {table_name} t
-            LEFT JOIN identitas_organisasi io ON io.kode_organisasi = t.kode_organisasi
-            ORDER BY t.id DESC
-            LIMIT ?
-            """, conn, params=[limit]
-        )
-
-# ======================== Helpers UI/Input ========================
-def load_hmhi_to_kode():
-    """Ambil HMHI cabang → kode_organisasi dari identitas_organisasi."""
-    with connect() as conn:
-        try:
-            df = pd.read_sql_query(
-                "SELECT hmhi_cabang, kode_organisasi FROM identitas_organisasi ORDER BY id DESC",
-                conn
-            )
-            if df.empty:
-                return {}, []
-            mapping = {}
-            for _, row in df.iterrows():
-                hmhi = (str(row["hmhi_cabang"]).strip() if pd.notna(row["hmhi_cabang"]) else "")
-                kode = (str(row["kode_organisasi"]).strip() if pd.notna(row["kode_organisasi"]) else "")
-                if hmhi:
-                    mapping[hmhi] = kode
-            return mapping, sorted(mapping.keys())
-        except Exception:
-            return {}, []
-
-def safe_float(val, default=0.0):
-    try:
-        x = pd.to_numeric(val, errors="coerce")
-        if pd.isna(x):
-            return default
-        return float(x)
-    except Exception:
-        return default
-
-# ======================== Startup ========================
-migrate_if_needed(TABLE)
-init_db(TABLE)
-
-# ======================== Label statis untuk "Jenis" ========================
+# ======================== Label statis & opsi lain ========================
 JENIS_LABELS = [
     "Hemofilia A Berat",
     "Hemofilia B Berat",
@@ -190,7 +35,7 @@ TEMPLATE_COLUMNS = [
     "Estimasi/Data real",
 ]
 ALIAS_TO_DB = {
-    "HMHI cabang": "hmhi_cabang_info",                 # dipakai untuk mapping → kode_organisasi
+    "HMHI cabang": "hmhi_cabang_info",                 # kolom bantu → mapping ke kode_organisasi
     "Jenis": "jenis",
     "0–18 tahun (%)": "persen_0_18",
     ">18 tahun (%)": "persen_gt_18",
@@ -201,14 +46,100 @@ ALIAS_TO_DB = {
     "Estimasi/Data real": "estimasi_data_real",
 }
 
+# ======================== Helper umum ========================
+def safe_float(val, default=0.0):
+    try:
+        x = pd.to_numeric(val, errors="coerce")
+        if pd.isna(x):
+            return default
+        return float(x)
+    except Exception:
+        return default
+
+def load_hmhi_to_kode_pg():
+    """
+    Ambil mapping HMHI cabang -> kode_organisasi dari public.identitas_organisasi (Supabase).
+    Return:
+        mapping: dict {hmhi_cabang -> kode_organisasi}
+        options: list[str] hmhi_cabang (urut alfabet)
+    """
+    try:
+        df = pg_fetch_df(f"""
+            SELECT hmhi_cabang, kode_organisasi
+            FROM {IDENT_TABLE}
+            WHERE COALESCE(hmhi_cabang, '') <> ''
+            ORDER BY id DESC
+        """)
+        if df.empty:
+            return {}, []
+        mapping = {}
+        for _, row in df.iterrows():
+            hmhi = (str(row["hmhi_cabang"]).strip() if pd.notna(row["hmhi_cabang"]) else "")
+            kode = (str(row["kode_organisasi"]).strip() if pd.notna(row["kode_organisasi"]) else "")
+            if hmhi and kode:
+                mapping[hmhi] = kode
+        return mapping, sorted(mapping.keys())
+    except Exception:
+        return {}, []
+
+def insert_row_pg(payload: dict, kode_organisasi: str):
+    """
+    INSERT 1 baris ke public.hemo_berat_prophylaxis_usia.
+    created_at diisi NOW() (timestamp server).
+    """
+    sql = f"""
+    INSERT INTO {SUPABASE_TABLE} (
+        kode_organisasi, created_at,
+        jenis, persen_0_18, persen_gt_18, frekuensi,
+        produk, tidak_ada_data, dosis_per_kedatangan, estimasi_data_real
+    )
+    VALUES (
+        :kode_organisasi, NOW(),
+        :jenis, :persen_0_18, :persen_gt_18, :frekuensi,
+        :produk, :tidak_ada_data, :dosis_per_kedatangan, :estimasi_data_real
+    )
+    """
+    params = {
+        "kode_organisasi": kode_organisasi,
+        "jenis": payload.get("jenis"),
+        "persen_0_18": safe_float(payload.get("persen_0_18"), 0.0),
+        "persen_gt_18": safe_float(payload.get("persen_gt_18"), 0.0),
+        "frekuensi": payload.get("frekuensi"),
+        "produk": payload.get("produk"),
+        "tidak_ada_data": payload.get("tidak_ada_data"),
+        "dosis_per_kedatangan": safe_float(payload.get("dosis_per_kedatangan"), 0.0),
+        "estimasi_data_real": payload.get("estimasi_data_real"),
+    }
+    pg_exec_sql(sql, params)
+
+def read_with_kota_pg(limit=1000):
+    """
+    Ambil data + join identitas_organisasi untuk hmhi_cabang & kota_cakupan_cabang.
+    """
+    lim = int(limit)
+    q = f"""
+    SELECT
+      t.id, t.kode_organisasi, t.created_at,
+      t.jenis, t.persen_0_18, t.persen_gt_18, t.frekuensi,
+      t.produk, t.tidak_ada_data, t.dosis_per_kedatangan, t.estimasi_data_real,
+      io.hmhi_cabang,
+      io.kota_cakupan_cabang
+    FROM {SUPABASE_TABLE} t
+    LEFT JOIN {IDENT_TABLE} io
+      ON io.kode_organisasi = t.kode_organisasi
+    ORDER BY t.id DESC
+    LIMIT {lim}
+    """
+    return pg_fetch_df(q)
+
 # ======================== UI ========================
 tab_input, tab_data = st.tabs(["📝 Input", "📄 Data"])
 
 with tab_input:
     # ---- Pilihan dari HMHI Cabang (bukan Kode Organisasi) ----
-    hmhi_map, hmhi_list = load_hmhi_to_kode()
+    hmhi_map, hmhi_list = load_hmhi_to_kode_pg()
     if not hmhi_list:
-        st.warning("Belum ada data Identitas Organisasi (HMHI cabang).")
+        st.warning("Belum ada data Identitas Organisasi (HMHI cabang) di Supabase.")
         selected_hmhi = None
     else:
         selected_hmhi = st.selectbox(
@@ -266,7 +197,7 @@ with tab_input:
         submit = st.form_submit_button("💾 Simpan")
 
     if submit:
-        # peringatan ringan bila persentase out-of-range
+        # peringatan ringan bila persentase out-of-range (tetap disimpan)
         bad = []
         for i, row in ed.iterrows():
             p1 = safe_float(row.get("persen_0_18", 0))
@@ -295,7 +226,7 @@ with tab_input:
                     est  = str(row.get("estimasi_data_real") or "").strip()
 
                     # lewati baris benar-benar kosong
-                    if (p0_18 == 0 and pgt18 == 0 and not frek and not prod and not tdd and dosis == 0 and not est):
+                    if (p0_18 == 0 and pgt18 == 0 and not frek and not prod and not tdd and dosis == 0 and not est and not jenis):
                         continue
 
                     payload = {
@@ -308,8 +239,11 @@ with tab_input:
                         "dosis_per_kedatangan": dosis,
                         "estimasi_data_real": est,
                     }
-                    insert_row(TABLE, payload, kode_organisasi)
-                    n_saved += 1
+                    try:
+                        insert_row_pg(payload, kode_organisasi)
+                        n_saved += 1
+                    except Exception as e:
+                        st.error(f"Gagal menyimpan baris ({jenis}): {e}")
 
                 if n_saved > 0:
                     st.success(f"{n_saved} baris tersimpan untuk **{selected_hmhi}**.")
@@ -318,7 +252,12 @@ with tab_input:
 
 with tab_data:
     st.subheader("📄 Data Tersimpan")
-    df = read_with_kota(TABLE, limit=1000)
+    try:
+        df = read_with_kota_pg(limit=1000)
+    except Exception as e:
+        st.error(f"Gagal membaca data dari Supabase: {e}")
+        df = pd.DataFrame()
+
     if df.empty:
         st.info("Belum ada data tersimpan.")
     else:
@@ -342,6 +281,11 @@ with tab_data:
             "dosis_per_kedatangan": "Dosis diterima (IU)/kedatangan",
             "estimasi_data_real": "Estimasi/Data real",
         })
+
+        # Hindari error Excel datetime tz → stringify bila ada
+        if "Created At" in view.columns:
+            view["Created At"] = view["Created At"].astype(str)
+
         st.dataframe(view, use_container_width=True)
 
         # Unduh Excel (data tersimpan)
@@ -391,13 +335,13 @@ with tab_data:
 
     def process_upload(df_up: pd.DataFrame):
         """Validasi & simpan unggahan. Return (log_df, n_ok)."""
-        hmhi_map, _ = load_hmhi_to_kode()
+        hmhi_map, _ = load_hmhi_to_kode_pg()
         results = []
         n_ok = 0
 
         for i in range(len(df_up)):
             try:
-                s = df_up.iloc[i]  # Series → punya .get
+                s = df_up.iloc[i]  # Series
                 hmhi = str((s.get("hmhi_cabang_info") or "")).strip()
                 if not hmhi:
                     raise ValueError("Kolom 'HMHI cabang' kosong.")
@@ -414,7 +358,6 @@ with tab_data:
                 dosis = safe_float(s.get("dosis_per_kedatangan", 0.0))
                 est   = str((s.get("estimasi_data_real") or "")).strip()
 
-                # Validasi ringan % 0–100
                 warn = []
                 if p0_18 < 0 or p0_18 > 100: warn.append("0–18% di luar 0–100")
                 if pgt18 < 0 or pgt18 > 100: warn.append(">18% di luar 0–100")
@@ -434,7 +377,7 @@ with tab_data:
                     "dosis_per_kedatangan": dosis,
                     "estimasi_data_real": est,
                 }
-                insert_row(TABLE, payload, kode_organisasi)
+                insert_row_pg(payload, kode_organisasi)
 
                 info = f"Simpan → {hmhi} / {jenis or '(tanpa jenis)'}"
                 if warn: info += " | Peringatan: " + "; ".join(warn)
@@ -463,7 +406,6 @@ with tab_data:
         # Pastikan semua kolom template ada
         for c in TEMPLATE_COLUMNS:
             if c not in raw.columns:
-                # default sesuai tipe
                 if c in ("0–18 tahun (%)", ">18 tahun (%)", "Dosis diterima (IU)/kedatangan"):
                     raw[c] = 0
                 else:
