@@ -18,17 +18,17 @@ TABLE_ORG = "public.identitas_organisasi"
 def insert_row(table_name: str, payload: dict, kode_organisasi: str):
     """
     Insert baris baru. Kolom created_at akan menggunakan default NOW() di Postgres.
-    Skema kolom:
+    Skema kolom baru:
       id, kode_organisasi, created_at, produk, ketersediaan, digunakan, merk,
-      jumlah_pengguna, jumlah_iu_per_kemasan, harga
+      jumlah_pengguna, jumlah_iu_per_kemasan, harga, perkiraan_penggunaan_tahun
     """
     sql = f"""
         INSERT INTO {table_name}
             (kode_organisasi, produk, ketersediaan, digunakan, merk,
-             jumlah_pengguna, jumlah_iu_per_kemasan, harga)
+             jumlah_pengguna, jumlah_iu_per_kemasan, harga, perkiraan_penggunaan_tahun)
         VALUES
             (:kode_organisasi, :produk, :ketersediaan, :digunakan, :merk,
-             :jumlah_pengguna, :jumlah_iu_per_kemasan, :harga)
+             :jumlah_pengguna, :jumlah_iu_per_kemasan, :harga, :perkiraan_penggunaan_tahun)
     """
     params = {
         "kode_organisasi": kode_organisasi,
@@ -39,6 +39,7 @@ def insert_row(table_name: str, payload: dict, kode_organisasi: str):
         "jumlah_pengguna": int(payload.get("jumlah_pengguna") or 0),
         "jumlah_iu_per_kemasan": int(payload.get("jumlah_iu_per_kemasan") or 0),
         "harga": float(payload.get("harga") or 0.0),
+        "perkiraan_penggunaan_tahun": int(payload.get("perkiraan_penggunaan_tahun") or 0),
     }
     pg_exec_sql(sql, params)
 
@@ -51,6 +52,7 @@ def read_with_kota(table_name: str, limit=1000):
           t.id, t.kode_organisasi, t.created_at,
           t.produk, t.ketersediaan, t.digunakan, t.merk,
           t.jumlah_pengguna, t.jumlah_iu_per_kemasan, t.harga,
+          t.perkiraan_penggunaan_tahun,
           io.hmhi_cabang, io.kota_cakupan_cabang
         FROM {table_name} t
         LEFT JOIN {TABLE_ORG} io ON io.kode_organisasi = t.kode_organisasi
@@ -128,6 +130,7 @@ TEMPLATE_COLUMNS = [
     "Jumlah Pengguna",
     "Jumlah iu/vial per kemasan",
     "Harga",
+    "Perkiraan Jumlah Penggunaan/Tahun",
 ]
 ALIAS_TO_DB = {
     "HMHI cabang": "hmhi_cabang_info",            # hanya untuk mapping ke kode_organisasi
@@ -138,6 +141,7 @@ ALIAS_TO_DB = {
     "Jumlah Pengguna": "jumlah_pengguna",
     "Jumlah iu/vial per kemasan": "jumlah_iu_per_kemasan",
     "Harga": "harga",
+    "Perkiraan Jumlah Penggunaan/Tahun": "perkiraan_penggunaan_tahun",
 }
 
 # ======================== UI ========================
@@ -167,6 +171,7 @@ with tab_input:
         "jumlah_pengguna": [0, 0, 0, 0, 0],
         "jumlah_iu_per_kemasan": [0, 0, 0, 0, 0],
         "harga": [0.0, 0.0, 0.0, 0.0, 0.0],
+        "perkiraan_penggunaan_tahun": [0, 0, 0, 0, 0],
     })
 
     with st.form("rt::form"):
@@ -202,6 +207,9 @@ with tab_input:
                 "harga": st.column_config.NumberColumn(
                     "Harga", help="Nilai numerik (contoh: 1250000)", min_value=0.0, step=1000.0, format="%.0f"
                 ),
+                "perkiraan_penggunaan_tahun": st.column_config.NumberColumn(
+                    "Perkiraan Jumlah Penggunaan/Tahun", min_value=0, step=1
+                ),
             },
         )
         submit = st.form_submit_button("💾 Simpan")
@@ -223,11 +231,12 @@ with tab_input:
                     jml_pengguna = safe_int(row.get("jumlah_pengguna", 0))
                     jml_iu = safe_int(row.get("jumlah_iu_per_kemasan", 0))
                     harga = safe_float(row.get("harga", 0.0))
+                    perkir_tahun = safe_int(row.get("perkiraan_penggunaan_tahun", 0))
 
                     # baris kosong dilewati
                     is_all_empty = (
                         not produk and not ketersediaan and not digunakan and not merk
-                        and jml_pengguna == 0 and jml_iu == 0 and harga == 0.0
+                        and jml_pengguna == 0 and jml_iu == 0 and harga == 0.0 and perkir_tahun == 0
                     )
                     if is_all_empty:
                         continue
@@ -240,6 +249,7 @@ with tab_input:
                         "jumlah_pengguna": jml_pengguna,
                         "jumlah_iu_per_kemasan": jml_iu,
                         "harga": harga,
+                        "perkiraan_penggunaan_tahun": perkir_tahun,
                     }
                     insert_row(TABLE, payload, kode_organisasi)
                     n_saved += 1
@@ -259,7 +269,8 @@ with tab_data:
         cols_order = [
             "hmhi_cabang", "kota_cakupan_cabang", "created_at",
             "produk", "ketersediaan", "digunakan", "merk",
-            "jumlah_pengguna", "jumlah_iu_per_kemasan", "harga"
+            "jumlah_pengguna", "jumlah_iu_per_kemasan", "harga",
+            "perkiraan_penggunaan_tahun"
         ]
         cols_order = [c for c in cols_order if c in df.columns]
         view = df[cols_order].rename(columns={
@@ -273,6 +284,7 @@ with tab_data:
             "jumlah_pengguna": "Jumlah Pengguna",
             "jumlah_iu_per_kemasan": "Jumlah iu/vial per kemasan",
             "harga": "Harga",
+            "perkiraan_penggunaan_tahun": "Perkiraan Jumlah Penggunaan/Tahun",
         })
 
         # Format kolom Harga ke tampilan ribuan (tanpa mengubah data asli)
@@ -313,6 +325,7 @@ with tab_data:
         "Jumlah Pengguna": 0,
         "Jumlah iu/vial per kemasan": 0,
         "Harga": 0,
+        "Perkiraan Jumlah Penggunaan/Tahun": 0,
     }], columns=TEMPLATE_COLUMNS)
     buf_tmpl = io.BytesIO()
     with pd.ExcelWriter(buf_tmpl, engine="xlsxwriter") as w:
@@ -364,11 +377,12 @@ with tab_data:
                 jml_pengguna = safe_int(s.get("jumlah_pengguna", 0))
                 jml_iu       = safe_int(s.get("jumlah_iu_per_kemasan", 0))
                 harga_val    = safe_float(s.get("harga", 0.0))
+                perkir_tahun = safe_int(s.get("perkiraan_penggunaan_tahun", 0))
 
                 # jika benar-benar kosong, lewati
                 is_all_empty = (
                     not produk and not ketersediaan and not digunakan and not merk
-                    and jml_pengguna == 0 and jml_iu == 0 and harga_val == 0.0
+                    and jml_pengguna == 0 and jml_iu == 0 and harga_val == 0.0 and perkir_tahun == 0
                 )
                 if is_all_empty:
                     results.append({"Baris Excel": i+2, "Status": "LEWAT", "Keterangan": "Baris kosong — dilewati"})
@@ -382,6 +396,7 @@ with tab_data:
                     "jumlah_pengguna": jml_pengguna,
                     "jumlah_iu_per_kemasan": jml_iu,
                     "harga": harga_val,
+                    "perkiraan_penggunaan_tahun": perkir_tahun,
                 }
                 insert_row(TABLE, payload, kode_organisasi)
                 results.append({"Baris Excel": i+2, "Status": "OK", "Keterangan": f"Simpan → {hmhi} / {produk or '(tanpa produk)'}"})
