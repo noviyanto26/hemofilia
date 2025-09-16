@@ -12,32 +12,26 @@ TABLE_RS_PENANGAN = "public.rs_penangan_hemofilia"
 TABLE_ORG         = "public.identitas_organisasi"
 TABLE_RS_MASTER   = "public.rumah_sakit"
 
-TIPE_RS_OPTIONS = [
-    "RSU Tipe A", "RSU Tipe B", "RSU Tipe C", "RSU Tipe D",
-    "RS Swasta Tipe A", "RS Swasta Tipe B", "RS Swasta Tipe C", "RS Swasta Tipe D",
-]
-YA_TIDAK_OPTIONS = ["Ya", "Tidak"]
+YA_TIDAK_OPTIONS  = ["Ya", "Tidak"]
 
+# ===== Template unggah =====
 TEMPLATE_COLUMNS = [
-    "HMHI cabang",            # dipetakan ke kode_organisasi via identitas_organisasi
-    "Kode RS",                # pilih dari master RS (kode_rs)
-    "Nama Rumah Sakit",       # opsional; fallback dari master jika kosong & Kode RS ada
-    "Tipe RS",                # opsional; boleh override master
-    "Terdapat Dokter Hematologi",     # Ya/Tidak
-    "Terdapat Tim Terpadu Hemofilia", # Ya/Tidak
+    "HMHI cabang",                      # dipetakan ke kode_organisasi
+    "Kode RS",                          # pilih dari master RS (kode_rs)
+    "Tipe RS",                          # FREE TEXT (manual)
+    "Terdapat Dokter Hematologi",       # Ya/Tidak
+    "Terdapat Tim Terpadu Hemofilia",   # Ya/Tidak
 ]
 ALIAS_TO_DB = {
     "HMHI cabang": "hmhi_cabang_info",
     "Kode RS": "kode_rs",
-    "Nama Rumah Sakit": "nama_rumah_sakit",
     "Tipe RS": "tipe_rs",
     "Terdapat Dokter Hematologi": "dokter_hematologi",
     "Terdapat Tim Terpadu Hemofilia": "tim_terpadu",
 }
 
-# =============== KONEKTOR DB (ikuti pola Identitas Organisasi) ===============
-# Menggunakan helper dari db.py seperti pada halaman Identitas Organisasi
-from db import fetch_df as pg_fetch_df, exec_sql as pg_exec_sql  # :contentReference[oaicite:1]{index=1}
+# =============== KONEKTOR DB (mengikuti pola file Identitas Organisasi) ===============
+from db import fetch_df as pg_fetch_df, exec_sql as pg_exec_sql  # pastikan db.py tersedia
 
 # =============== HELPERS ===============
 def load_hmhi_to_kode() -> tuple[dict, list]:
@@ -54,18 +48,33 @@ def load_hmhi_to_kode() -> tuple[dict, list]:
     return mapping, sorted(mapping.keys())
 
 def load_rs_master() -> pd.DataFrame:
-    """Master RS dari public.rumah_sakit (kode_rs, nama_rs, kota, provinsi, tipe_rs, kelas_rs, kontak)."""
+    """Master RS dari public.rumah_sakit (kode_rs, nama_rs, kota, provinsi, ...)."""
     return pg_fetch_df(f"""
         SELECT kode_rs, nama_rs, kota, provinsi, tipe_rs, kelas_rs, kontak
         FROM {TABLE_RS_MASTER}
         ORDER BY nama_rs
     """)
 
-def insert_row(payload: dict, kode_organisasi: str) -> None:
+def insert_row_from_inputs(
+    kode_organisasi: str,
+    kode_rs: str,
+    tipe_rs_manual: str | None,
+    dokter: str | None,
+    tim: str | None,
+    rs_master: pd.DataFrame
+) -> None:
     """
-    Insert ke public.rs_penangan_hemofilia (created_at default NOW() di DB):
-      kolom: id, kode_organisasi, kode_rs, created_at, nama_rumah_sakit, tipe_rs, dokter_hematologi, tim_terpadu
+    Insert ke public.rs_penangan_hemofilia:
+    - nama_rumah_sakit diambil dari master (berdasarkan kode_rs)
+    - tipe_rs diambil DARI INPUT MANUAL (free text), bukan dari master
     """
+    m = rs_master[rs_master["kode_rs"].astype(str).str.strip().str.casefold() == str(kode_rs).strip().casefold()]
+    if m.empty:
+        raise ValueError(f"Kode RS '{kode_rs}' tidak ada di master.")
+
+    nama_final = str(m.iloc[0]["nama_rs"] or "").strip()
+    tipe_final = (tipe_rs_manual or "").strip() or None  # pakai input manual; boleh None
+
     sql = f"""
         INSERT INTO {TABLE_RS_PENANGAN}
             (kode_organisasi, kode_rs, nama_rumah_sakit, tipe_rs, dokter_hematologi, tim_terpadu)
@@ -74,30 +83,28 @@ def insert_row(payload: dict, kode_organisasi: str) -> None:
     """
     params = {
         "kode_organisasi": kode_organisasi,
-        "kode_rs": payload.get("kode_rs") or None,
-        "nama_rumah_sakit": payload.get("nama_rumah_sakit") or None,
-        "tipe_rs": payload.get("tipe_rs") or None,
-        "dokter_hematologi": payload.get("dokter_hematologi") or None,
-        "tim_terpadu": payload.get("tim_terpadu") or None,
+        "kode_rs": str(kode_rs).strip(),
+        "nama_rumah_sakit": nama_final,
+        "tipe_rs": tipe_final,                               # ← free text
+        "dokter_hematologi": dokter if (dokter in YA_TIDAK_OPTIONS) else None,
+        "tim_terpadu":       tim    if (tim    in YA_TIDAK_OPTIONS) else None,
     }
     pg_exec_sql(sql, params)
 
 def read_rs_penangan_with_join(limit: int = 500) -> pd.DataFrame:
     """
-    Ambil data tersimpan + join identitas_organisasi & rumah_sakit.
-    Nama/Tipe RS diambil dari entri penangan jika ada; kalau NULL, fallback ke master RS.
+    Ambil data + join identitas_organisasi & rumah_sakit.
+    tipe_rs ditampilkan dari tabel penangan (isi manual).
     """
     return pg_fetch_df(f"""
         SELECT
           t.id, t.created_at,
           t.kode_organisasi, io.hmhi_cabang, io.kota_cakupan_cabang,
-          t.kode_rs,
-          COALESCE(t.nama_rumah_sakit, rs.nama_rs) AS nama_rumah_sakit,
-          COALESCE(t.tipe_rs, rs.tipe_rs)          AS tipe_rs,
+          t.kode_rs, t.nama_rumah_sakit, t.tipe_rs,
           t.dokter_hematologi, t.tim_terpadu,
           rs.kota, rs.provinsi, rs.kelas_rs, rs.kontak
         FROM {TABLE_RS_PENANGAN} t
-        LEFT JOIN {TABLE_ORG} io ON io.kode_organisasi = t.kode_organisasi
+        LEFT JOIN {TABLE_ORG}       io ON io.kode_organisasi = t.kode_organisasi
         LEFT JOIN {TABLE_RS_MASTER} rs ON rs.kode_rs = t.kode_rs
         ORDER BY t.id DESC
         LIMIT {int(limit)}
@@ -119,7 +126,7 @@ with tab_input:
     if df_rs.empty:
         st.error("Master rumah_sakit kosong. Tambahkan data ke public.rumah_sakit (kode_rs, nama_rs, kota, provinsi, dst.).")
     else:
-        # Opsi label ramah: "KODE — Nama (Kota, Provinsi)"
+        # Label ramah: "KODE — Nama (Kota, Provinsi)"
         rs_map_by_label = {}
         rs_options = [""]
         for _, r in df_rs.iterrows():
@@ -128,14 +135,13 @@ with tab_input:
             kota    = (str(r["kota"]).strip() if pd.notna(r["kota"]) else "")
             prov    = (str(r["provinsi"]).strip() if pd.notna(r["provinsi"]) else "")
             label = f"{kode_rs} — {nama}" + (f" ({kota}, {prov})" if (kota or prov) else "")
-            rs_map_by_label[label] = {"kode_rs": kode_rs, "nama_rs": nama, "tipe_rs": r.get("tipe_rs")}
+            rs_map_by_label[label] = {"kode_rs": kode_rs}
             rs_options.append(label)
 
-        # Template editor
+        # Editor: TANPA override, dengan kolom Tipe RS (text)
         df_default = pd.DataFrame({
             "rs_label": ["", "", "", "", ""],           # pilih dari master
-            "override_nama": ["", "", "", "", ""],      # opsional
-            "override_tipe": ["", "", "", "", ""],      # opsional
+            "tipe_rs": ["", "", "", "", ""],            # FREE TEXT (manual)
             "dokter_hematologi": ["", "", "", "", ""],  # Ya/Tidak
             "tim_terpadu": ["", "", "", "", ""],        # Ya/Tidak
         })
@@ -148,32 +154,43 @@ with tab_input:
                     "rs_label": st.column_config.SelectboxColumn(
                         "Pilih RS (Kode — Nama — Lokasi)", options=rs_options, required=False
                     ),
-                    "override_nama": st.column_config.TextColumn("Override Nama RS (opsional)"),
-                    "override_tipe": st.column_config.SelectboxColumn("Override Tipe RS (opsional)", options=[""] + TIPE_RS_OPTIONS),
-                    "dokter_hematologi": st.column_config.SelectboxColumn("Terdapat Dokter Hematologi", options=[""] + YA_TIDAK_OPTIONS),
-                    "tim_terpadu": st.column_config.SelectboxColumn("Terdapat Tim Terpadu Hemofilia", options=[""] + YA_TIDAK_OPTIONS),
+                    "tipe_rs": st.column_config.TextColumn(
+                        "Tipe RS (isi manual)", help="Contoh: RSU Tipe B, RS Swasta Tipe C, dll. Boleh dikosongkan."
+                    ),
+                    "dokter_hematologi": st.column_config.SelectboxColumn(
+                        "Terdapat Dokter Hematologi", options=[""] + YA_TIDAK_OPTIONS
+                    ),
+                    "tim_terpadu": st.column_config.SelectboxColumn(
+                        "Terdapat Tim Terpadu Hemofilia", options=[""] + YA_TIDAK_OPTIONS
+                    ),
                 },
                 use_container_width=True,
                 num_rows="dynamic",
                 hide_index=True,
             )
 
-            # Pratinjau
+            # Pratinjau—nama dari master, tipe RS dari input manual
             if not edited.empty:
                 prv = []
+                df_rs_idx = df_rs.copy()
+                df_rs_idx["kode_rs_key"] = df_rs_idx["kode_rs"].astype(str).str.strip().str.casefold()
                 for _, r in edited.iterrows():
-                    lbl   = (r.get("rs_label") or "").strip()
-                    base  = rs_map_by_label.get(lbl, {})
-                    nama  = r.get("override_nama") or base.get("nama_rs") or ""
-                    tipe  = r.get("override_tipe") or base.get("tipe_rs") or ""
+                    lbl = (r.get("rs_label") or "").strip()
+                    base = rs_map_by_label.get(lbl, {})
+                    kode_rs = base.get("kode_rs", "")
+                    if kode_rs:
+                        m = df_rs_idx[df_rs_idx["kode_rs_key"] == kode_rs.strip().casefold()]
+                        nama = str(m.iloc[0]["nama_rs"]) if not m.empty else ""
+                    else:
+                        nama = ""
                     prv.append({
-                        "Kode RS": base.get("kode_rs", ""),
-                        "Nama RS (hasil)": nama,
-                        "Tipe RS (hasil)": tipe,
+                        "Kode RS": kode_rs,
+                        "Nama RS (master)": nama,
+                        "Tipe RS (input)": (r.get("tipe_rs") or "").strip(),
                         "Dokter Hematologi": r.get("dokter_hematologi", ""),
                         "Tim Terpadu": r.get("tim_terpadu", ""),
                     })
-                st.caption("Pratinjau baris yang akan disimpan:")
+                st.caption("Pratinjau baris yang akan disimpan (Nama dari master, Tipe RS dari input manual):")
                 st.dataframe(pd.DataFrame(prv), use_container_width=True)
 
             submitted = st.form_submit_button("💾 Simpan")
@@ -196,30 +213,24 @@ with tab_input:
                         if not kode_rs:
                             continue  # wajib pilih RS dari master
 
-                        nama_final = (r.get("override_nama") or base.get("nama_rs") or "").strip()
-                        tipe_final = (r.get("override_tipe") or base.get("tipe_rs") or "").strip()
+                        tipe_manual = (r.get("tipe_rs") or "").strip() or None
                         dokter = (r.get("dokter_hematologi") or "").strip()
                         tim    = (r.get("tim_terpadu") or "").strip()
-
-                        # Validasi
                         if dokter and dokter not in YA_TIDAK_OPTIONS:
-                            st.warning(f"Baris di-skip: 'Terdapat Dokter Hematologi' harus Ya/Tidak. Nilai: {dokter}")
+                            st.warning("Baris di-skip: 'Terdapat Dokter Hematologi' harus Ya/Tidak.")
                             continue
                         if tim and tim not in YA_TIDAK_OPTIONS:
-                            st.warning(f"Baris di-skip: 'Terdapat Tim Terpadu Hemofilia' harus Ya/Tidak. Nilai: {tim}")
-                            continue
-                        if not nama_final:
-                            st.warning("Baris di-skip: Nama RS kosong (master & override kosong).")
+                            st.warning("Baris di-skip: 'Terdapat Tim Terpadu Hemofilia' harus Ya/Tidak.")
                             continue
 
-                        payload = {
-                            "kode_rs": kode_rs,
-                            "nama_rumah_sakit": nama_final,
-                            "tipe_rs": tipe_final if tipe_final in TIPE_RS_OPTIONS else None,
-                            "dokter_hematologi": dokter if dokter in YA_TIDAK_OPTIONS else None,
-                            "tim_terpadu": tim if tim in YA_TIDAK_OPTIONS else None,
-                        }
-                        insert_row(payload, kode_organisasi)
+                        insert_row_from_inputs(
+                            kode_organisasi=kode_organisasi,
+                            kode_rs=kode_rs,
+                            tipe_rs_manual=tipe_manual,  # ← pakai input manual
+                            dokter=dokter or None,
+                            tim=tim or None,
+                            rs_master=df_rs
+                        )
                         n_saved += 1
 
                     if n_saved:
@@ -237,7 +248,7 @@ with tab_data:
     else:
         cols_order = [
             "hmhi_cabang", "kota_cakupan_cabang", "created_at",
-            "kode_rs", "nama_rumah_sakit", "tipe_rs",
+            "kode_rs", "nama_rumah_sakit", "tipe_rs",    # tipe_rs = input manual
             "dokter_hematologi", "tim_terpadu",
             "kota", "provinsi", "kelas_rs", "kontak"
         ]
@@ -273,11 +284,10 @@ with tab_data:
     st.divider()
     st.markdown("### 📥 Template & Unggah Excel")
 
-    # Template kosong
+    # Template kosong (pakai Tipe RS manual)
     tmpl_df = pd.DataFrame([{
         "HMHI cabang": "",
         "Kode RS": "",
-        "Nama Rumah Sakit": "",
         "Tipe RS": "",
         "Terdapat Dokter Hematologi": "",
         "Terdapat Tim Terpadu Hemofilia": "",
@@ -299,7 +309,7 @@ with tab_data:
     def process_upload(df_up: pd.DataFrame):
         hmhi_map, _ = load_hmhi_to_kode()
         rs_master = load_rs_master().copy()
-        rs_master["kode_rs_str"] = rs_master["kode_rs"].astype(str).str.strip()
+        rs_master["kode_rs_key"] = rs_master["kode_rs"].astype(str).str.strip().str.casefold()
 
         results = []
         for i in range(len(df_up)):
@@ -313,40 +323,28 @@ with tab_data:
                     raise ValueError(f"HMHI cabang '{hmhi}' tidak ditemukan di identitas_organisasi.")
 
                 kode_rs = str((s.get("kode_rs") or "")).strip()
-                nama    = str((s.get("nama_rumah_sakit") or "")).strip()
-                tipe    = str((s.get("tipe_rs") or "")).strip()
+                if not kode_rs:
+                    raise ValueError("Kolom 'Kode RS' wajib diisi.")
+
+                tipe_manual = (str((s.get("tipe_rs") or "")).strip() or None)  # free text
                 dokter  = str((s.get("dokter_hematologi") or "")).strip()
                 tim     = str((s.get("tim_terpadu") or "")).strip()
-
-                if kode_rs:
-                    m = rs_master[rs_master["kode_rs_str"].str.casefold() == kode_rs.casefold()]
-                    if m.empty:
-                        raise ValueError(f"Kode RS '{kode_rs}' tidak ada di master.")
-                    if not nama:
-                        nama = str(m.iloc[0]["nama_rs"] or "").strip()
-                    if not tipe:
-                        tipe = str(m.iloc[0]["tipe_rs"] or "").strip()
-
                 if dokter and dokter not in YA_TIDAK_OPTIONS:
                     raise ValueError("Kolom 'Terdapat Dokter Hematologi' harus 'Ya' atau 'Tidak'")
                 if tim and tim not in YA_TIDAK_OPTIONS:
                     raise ValueError("Kolom 'Terdapat Tim Terpadu Hemofilia' harus 'Ya' atau 'Tidak'")
 
-                if not nama:
-                    raise ValueError("Nama Rumah Sakit kosong (isi manual atau pilih Kode RS).")
-
-                payload = {
-                    "kode_rs": kode_rs or None,
-                    "nama_rumah_sakit": nama,
-                    "tipe_rs": tipe if tipe in TIPE_RS_OPTIONS else None,
-                    "dokter_hematologi": dokter if dokter in YA_TIDAK_OPTIONS else None,
-                    "tim_terpadu": tim if tim in YA_TIDAK_OPTIONS else None,
-                }
-                insert_row(payload, kode_organisasi)
-                results.append({"Baris Excel": i + 2, "Status": "OK", "Keterangan": f"Simpan → {hmhi} / {kode_rs or '-'} / {nama}"})
+                insert_row_from_inputs(
+                    kode_organisasi=kode_organisasi,
+                    kode_rs=kode_rs,
+                    tipe_rs_manual=tipe_manual,
+                    dokter=dokter or None,
+                    tim=tim or None,
+                    rs_master=rs_master
+                )
+                results.append({"Baris Excel": i + 2, "Status": "OK", "Keterangan": f"Simpan → {hmhi} / {kode_rs}"})
             except Exception as e:
                 results.append({"Baris Excel": i + 2, "Status": "GAGAL", "Keterangan": str(e)})
-
         return pd.DataFrame(results)
 
     if up is not None:
@@ -357,11 +355,12 @@ with tab_data:
             st.error(f"Gagal membaca file: {e}")
             st.stop()
 
-        missing = [c for c in ["HMHI cabang"] if c not in raw.columns]
+        missing = [c for c in ["HMHI cabang", "Kode RS"] if c not in raw.columns]
         if missing:
-            st.error("Header kolom tidak sesuai. Minimal harus ada: " + ", ".join(missing))
+            st.error("Header kolom tidak sesuai. Wajib ada: " + ", ".join(missing))
             st.stop()
 
+        # Tambahkan kolom opsional bila tidak ada
         for c in TEMPLATE_COLUMNS:
             if c not in raw.columns:
                 raw[c] = ""
