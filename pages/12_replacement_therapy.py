@@ -1,146 +1,74 @@
 import streamlit as st
-import sqlite3
 import pandas as pd
 from datetime import datetime
 import io
+from sqlalchemy import create_engine, text
 
 # ======================== Konfigurasi Halaman ========================
 st.set_page_config(page_title="Replacement Therapy", page_icon="🧪", layout="wide")
 st.title("🧪 Ketersediaan Produk Replacement Therapy")
 
-DB_PATH = "hemofilia.db"
-TABLE = "ketersediaan_produk_replacement"
+# ======================== Koneksi Database (Postgres) ========================
+# Gunakan secrets seperti referensi sebelumnya
+DB_URL = st.secrets["database"]["url"]
+engine = create_engine(DB_URL, pool_pre_ping=True, pool_recycle=300)
 
-# ======================== Util DB umum ========================
-def connect():
-    return sqlite3.connect(DB_PATH)
+def fetch_df(sql: str, params: dict | None = None) -> pd.DataFrame:
+    with engine.begin() as conn:
+        return pd.read_sql_query(text(sql), conn, params=params)
 
-def _table_exists(conn, table):
-    cur = conn.cursor()
-    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,))
-    return cur.fetchone() is not None
+def exec_sql(sql: str, params: dict | None = None) -> None:
+    with engine.begin() as conn:
+        conn.execute(text(sql), params or {})
 
-def _has_column(conn, table, col):
-    cur = conn.cursor()
-    cur.execute(f"PRAGMA table_info({table})")
-    return any((row[1] == col) for row in cur.fetchall())
+# ======================== Konstanta Tabel ========================
+TABLE = "public.ketersediaan_produk_replacement"
+TABLE_ORG = "public.identitas_organisasi"
 
-def migrate_if_needed(table_name: str):
+# ======================== Helpers DB (insert / read) ========================
+def insert_row(table_name: str, payload: dict, kode_organisasi: str):
     """
-    Pastikan skema final tersedia.
-    Skema final:
+    Insert baris baru. Kolom created_at akan menggunakan default NOW() di Postgres.
+    Skema kolom:
       id, kode_organisasi, created_at, produk, ketersediaan, digunakan, merk,
       jumlah_pengguna, jumlah_iu_per_kemasan, harga
     """
-    with connect() as conn:
-        cur = conn.cursor()
-        if not _table_exists(conn, table_name):
-            return
-
-        needed = [
-            "kode_organisasi",
-            "produk",
-            "ketersediaan",
-            "digunakan",
-            "merk",
-            "jumlah_pengguna",
-            "jumlah_iu_per_kemasan",
-            "harga",
-        ]
-        cur.execute(f"PRAGMA table_info({table_name})")
-        have = [r[1] for r in cur.fetchall()]
-        if all(col in have for col in needed):
-            return  # sudah sesuai
-
-        st.warning(f"Migrasi skema: menyesuaikan tabel {table_name} …")
-        cur.execute("PRAGMA foreign_keys=OFF")
-        try:
-            # Buat tabel baru dengan skema lengkap
-            cur.execute(f"""
-                CREATE TABLE IF NOT EXISTS {table_name}_new (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    kode_organisasi TEXT,
-                    created_at TEXT NOT NULL,
-                    produk TEXT,
-                    ketersediaan TEXT,
-                    digunakan TEXT,
-                    merk TEXT,
-                    jumlah_pengguna INTEGER,
-                    jumlah_iu_per_kemasan INTEGER,
-                    harga REAL,
-                    FOREIGN KEY (kode_organisasi) REFERENCES identitas_organisasi(kode_organisasi)
-                )
-            """)
-            # Salin kolom yang ada dari tabel lama
-            cur.execute(f"PRAGMA table_info({table_name})")
-            old_cols = [r[1] for r in cur.fetchall() if r[1] != "id"]
-            if old_cols:
-                cols_csv = ", ".join(old_cols)
-                cur.execute(f"INSERT INTO {table_name}_new ({cols_csv}) SELECT {cols_csv} FROM {table_name}")
-            # Ganti nama
-            cur.execute(f"ALTER TABLE {table_name} RENAME TO {table_name}_backup")
-            cur.execute(f"ALTER TABLE {table_name}_new RENAME TO {table_name}")
-            conn.commit()
-            st.success(f"Migrasi {table_name} selesai. Tabel lama disimpan sebagai _backup.")
-        except Exception as e:
-            conn.rollback()
-            st.error(f"Migrasi {table_name} gagal: {e}")
-        finally:
-            cur.execute("PRAGMA foreign_keys=ON")
-
-def init_db(table_name: str):
-    with connect() as conn:
-        c = conn.cursor()
-        c.execute(f"""
-            CREATE TABLE IF NOT EXISTS {table_name} (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                kode_organisasi TEXT,
-                created_at TEXT NOT NULL,
-                produk TEXT,
-                ketersediaan TEXT,
-                digunakan TEXT,
-                merk TEXT,
-                jumlah_pengguna INTEGER,
-                jumlah_iu_per_kemasan INTEGER,
-                harga REAL,
-                FOREIGN KEY (kode_organisasi) REFERENCES identitas_organisasi(kode_organisasi)
-            )
-        """)
-        conn.commit()
-
-def insert_row(table_name: str, payload: dict, kode_organisasi: str):
-    with connect() as conn:
-        c = conn.cursor()
-        cols = ", ".join(payload.keys())
-        placeholders = ", ".join(["?"] * len(payload))
-        vals = [payload[k] for k in payload]
-        c.execute(
-            f"INSERT INTO {table_name} (kode_organisasi, created_at, {cols}) VALUES (?, ?, {placeholders})",
-            [kode_organisasi, datetime.utcnow().isoformat()] + vals
-        )
-        conn.commit()
+    sql = f"""
+        INSERT INTO {table_name}
+            (kode_organisasi, produk, ketersediaan, digunakan, merk,
+             jumlah_pengguna, jumlah_iu_per_kemasan, harga)
+        VALUES
+            (:kode_organisasi, :produk, :ketersediaan, :digunakan, :merk,
+             :jumlah_pengguna, :jumlah_iu_per_kemasan, :harga)
+    """
+    params = {
+        "kode_organisasi": kode_organisasi,
+        "produk": payload.get("produk"),
+        "ketersediaan": payload.get("ketersediaan"),
+        "digunakan": payload.get("digunakan"),
+        "merk": payload.get("merk"),
+        "jumlah_pengguna": int(payload.get("jumlah_pengguna") or 0),
+        "jumlah_iu_per_kemasan": int(payload.get("jumlah_iu_per_kemasan") or 0),
+        "harga": float(payload.get("harga") or 0.0),
+    }
+    exec_sql(sql, params)
 
 def read_with_kota(table_name: str, limit=1000):
-    with connect() as conn:
-        # Jika belum ada foreign-key kolom, tetap tampilkan apa adanya
-        if not _has_column(conn, table_name, "kode_organisasi"):
-            st.error(f"Kolom 'kode_organisasi' belum tersedia di {table_name}. Coba refresh setelah migrasi.")
-            return pd.read_sql_query(f"SELECT * FROM {table_name} ORDER BY id DESC LIMIT ?", conn, params=[limit])
-
-        return pd.read_sql_query(
-            f"""
-            SELECT
-              t.id, t.kode_organisasi, t.created_at,
-              t.produk, t.ketersediaan, t.digunakan, t.merk,
-              t.jumlah_pengguna, t.jumlah_iu_per_kemasan, t.harga,
-              io.hmhi_cabang,
-              io.kota_cakupan_cabang
-            FROM {table_name} t
-            LEFT JOIN identitas_organisasi io ON io.kode_organisasi = t.kode_organisasi
-            ORDER BY t.id DESC
-            LIMIT ?
-            """, conn, params=[limit]
-        )
+    """
+    Ambil data + join identitas_organisasi untuk hmhi_cabang dan kota_cakupan_cabang.
+    """
+    sql = f"""
+        SELECT
+          t.id, t.kode_organisasi, t.created_at,
+          t.produk, t.ketersediaan, t.digunakan, t.merk,
+          t.jumlah_pengguna, t.jumlah_iu_per_kemasan, t.harga,
+          io.hmhi_cabang, io.kota_cakupan_cabang
+        FROM {table_name} t
+        LEFT JOIN {TABLE_ORG} io ON io.kode_organisasi = t.kode_organisasi
+        ORDER BY t.id DESC
+        LIMIT :lim
+    """
+    return fetch_df(sql, params={"lim": int(limit)})
 
 # ======================== Helpers UI/Input ========================
 def load_hmhi_to_kode():
@@ -150,23 +78,23 @@ def load_hmhi_to_kode():
         mapping: dict {hmhi_cabang -> kode_organisasi}
         options: list hmhi_cabang (urut alfabet)
     """
-    with connect() as conn:
-        try:
-            df = pd.read_sql_query(
-                "SELECT hmhi_cabang, kode_organisasi FROM identitas_organisasi ORDER BY id DESC",
-                conn
-            )
-            if df.empty:
-                return {}, []
-            mapping = {}
-            for _, row in df.iterrows():
-                hmhi = (str(row["hmhi_cabang"]).strip() if pd.notna(row["hmhi_cabang"]) else "")
-                kode = (str(row["kode_organisasi"]).strip() if pd.notna(row["kode_organisasi"]) else "")
-                if hmhi:
-                    mapping[hmhi] = kode
-            return mapping, sorted(mapping.keys())
-        except Exception:
+    try:
+        df = fetch_df(
+            f"SELECT hmhi_cabang, kode_organisasi FROM {TABLE_ORG} "
+            "WHERE hmhi_cabang IS NOT NULL AND hmhi_cabang <> '' "
+            "ORDER BY id DESC"
+        )
+        if df.empty:
             return {}, []
+        mapping = {}
+        for _, row in df.iterrows():
+            hmhi = (str(row["hmhi_cabang"]).strip() if pd.notna(row["hmhi_cabang"]) else "")
+            kode = (str(row["kode_organisasi"]).strip() if pd.notna(row["kode_organisasi"]) else "")
+            if hmhi:
+                mapping[hmhi] = kode
+        return mapping, sorted(mapping.keys())
+    except Exception:
+        return {}, []
 
 def safe_int(val, default=0):
     try:
@@ -185,10 +113,6 @@ def safe_float(val, default=0.0):
         return float(x)
     except Exception:
         return default
-
-# ======================== Startup ========================
-migrate_if_needed(TABLE)
-init_db(TABLE)
 
 # ======================== Konstanta UI ========================
 PRODUK_OPTIONS = [
@@ -312,7 +236,10 @@ with tab_input:
                     harga = safe_float(row.get("harga", 0.0))
 
                     # baris kosong dilewati
-                    is_all_empty = (not produk and not ketersediaan and not digunakan and not merk and jml_pengguna == 0 and jml_iu == 0 and harga == 0.0)
+                    is_all_empty = (
+                        not produk and not ketersediaan and not digunakan and not merk
+                        and jml_pengguna == 0 and jml_iu == 0 and harga == 0.0
+                    )
                     if is_all_empty:
                         continue
 
@@ -450,7 +377,10 @@ with tab_data:
                 harga_val    = safe_float(s.get("harga", 0.0))
 
                 # jika benar-benar kosong, lewati
-                is_all_empty = (not produk and not ketersediaan and not digunakan and not merk and jml_pengguna == 0 and jml_iu == 0 and harga_val == 0.0)
+                is_all_empty = (
+                    not produk and not ketersediaan and not digunakan and not merk
+                    and jml_pengguna == 0 and jml_iu == 0 and harga_val == 0.0
+                )
                 if is_all_empty:
                     results.append({"Baris Excel": i+2, "Status": "LEWAT", "Keterangan": "Baris kosong — dilewati"})
                     continue
