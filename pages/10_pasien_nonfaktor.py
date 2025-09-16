@@ -1,110 +1,168 @@
-import streamlit as st
-import sqlite3
-import pandas as pd
-from datetime import datetime
 import io
+import sqlite3
+from datetime import datetime
+from pathlib import Path
 
-st.set_page_config(page_title="Pasien Nonfaktor", page_icon="🩸", layout="wide")
-st.title("🩸 Pasien Pengguna Nonfaktor — Dengan & Tanpa Inhibitor")
+import pandas as pd
+import streamlit as st
 
-DB_PATH = "hemofilia.db"
-TABLE_INHIB = "pasien_nonfaktor_inhibitor"
-TABLE_TANPA = "pasien_nonfaktor_tanpa_inhibitor"
+# =========================
+# Konfigurasi & Konstanta
+# =========================
+st.set_page_config(page_title="Pasien Nonfaktor (Disatukan)", page_icon="🩸", layout="wide")
+st.title("🩸 Pasien Pengguna Nonfaktor — Total Dengan & Tanpa Inhibitor (Satu Tabel)")
 
-# ===== Template unggah & alias =====
-TEMPLATE_COLUMNS = [
-    "HMHI cabang",
-    "Jenis Penanganan",
-    "Ketersediaan",        # "", "Tersedia", "Tidak tersedia"
-    "Jumlah Pengguna",
-]
+BASE_DIR = Path(__file__).resolve().parent
+DB_PATH = str((BASE_DIR / "hemofilia.db").resolve())
+
+TABLE = "pasien_nonfaktor"   # disatukan
+LEGACY_INHIB = "pasien_nonfaktor_inhibitor"       # opsional (lama)
+LEGACY_TANPA = "pasien_nonfaktor_tanpa_inhibitor" # opsional (lama)
+
+TEMPLATE_COLUMNS = ["HMHI cabang", "Dengan inhibitor", "Tanpa inhibitor"]
 ALIAS_TO_DB = {
     "HMHI cabang": "hmhi_cabang_info",
-    "Jenis Penanganan": "jenis_penanganan",
-    "Ketersediaan": "ketersediaan",
-    "Jumlah Pengguna": "jumlah_pengguna",
+    "Dengan inhibitor": "dengan_inhibitor",
+    "Tanpa inhibitor": "tanpa_inhibitor",
 }
 
-# ======================== Util DB umum ========================
+# ======================== Util DB ========================
 def connect():
-    return sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
+
+def _table_exists(conn, name: str) -> bool:
+    cur = conn.cursor()
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (name,))
+    return cur.fetchone() is not None
 
 def _has_column(conn, table, col):
     cur = conn.cursor()
     cur.execute(f"PRAGMA table_info({table})")
-    return any((row[1] == col) for row in cur.fetchall())
+    return any((r[1] == col) for r in cur.fetchall())
 
-def _table_exists(conn, table):
-    cur = conn.cursor()
-    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,))
-    return cur.fetchone() is not None
+def create_main_schema(conn, as_new=False):
+    name = f"{TABLE}_new" if as_new else TABLE
+    conn.execute(f"""
+        CREATE TABLE IF NOT EXISTS {name} (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            kode_organisasi TEXT,
+            created_at TEXT NOT NULL,
+            dengan_inhibitor INTEGER NOT NULL DEFAULT 0,
+            tanpa_inhibitor INTEGER NOT NULL DEFAULT 0,
+            FOREIGN KEY (kode_organisasi) REFERENCES identitas_organisasi(kode_organisasi)
+        )
+    """)
 
-def migrate_if_needed(table_name: str):
-    """Pastikan skema final (termasuk kode_organisasi & kolom form) tersedia."""
+def migrate_if_needed():
     with connect() as conn:
-        if not _table_exists(conn, table_name):
-            return
-        needed = ["kode_organisasi", "jenis_penanganan", "ketersediaan", "jumlah_pengguna"]
-        cur = conn.cursor()
-        cur.execute(f"PRAGMA table_info({table_name})")
-        have = [r[1] for r in cur.fetchall()]
-        if all(col in have for col in needed):
+        if not _table_exists(conn, TABLE):
+            create_main_schema(conn)
+            conn.commit()
             return
 
-        st.warning(f"Migrasi skema: menyesuaikan tabel {table_name} …")
-        cur.execute("PRAGMA foreign_keys=OFF")
+        need = ["kode_organisasi", "created_at", "dengan_inhibitor", "tanpa_inhibitor"]
+        cur = conn.cursor()
+        cur.execute(f"PRAGMA table_info({TABLE})")
+        have = [r[1] for r in cur.fetchall()]
+        if all(c in have for c in need):
+            return
+
+        st.warning("Migrasi skema: menyesuaikan tabel pasien_nonfaktor …")
         try:
-            cur.execute(f"""
-                CREATE TABLE IF NOT EXISTS {table_name}_new (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    kode_organisasi TEXT,
-                    created_at TEXT NOT NULL,
-                    jenis_penanganan TEXT,
-                    ketersediaan TEXT,
-                    jumlah_pengguna INTEGER,
-                    FOREIGN KEY (kode_organisasi) REFERENCES identitas_organisasi(kode_organisasi)
-                )
+            conn.execute("PRAGMA foreign_keys=OFF")
+            create_main_schema(conn, as_new=True)
+
+            # copy kolom yang ada
+            cur.execute(f"PRAGMA table_info({TABLE})")
+            old_cols = [r[1] for r in cur.fetchall()]
+            sel = []
+            sel.append("id" if "id" in old_cols else "NULL AS id")
+            sel.append("kode_organisasi" if "kode_organisasi" in old_cols else "NULL AS kode_organisasi")
+            sel.append("created_at" if "created_at" in old_cols else f"'{datetime.utcnow().isoformat()}' AS created_at")
+            sel.append("dengan_inhibitor" if "dengan_inhibitor" in old_cols else "0 AS dengan_inhibitor")
+            sel.append("tanpa_inhibitor" if "tanpa_inhibitor" in old_cols else "0 AS tanpa_inhibitor")
+            select_sql = ", ".join(sel)
+            conn.execute(f"""
+                INSERT INTO {TABLE}_new (id, kode_organisasi, created_at, dengan_inhibitor, tanpa_inhibitor)
+                SELECT {select_sql} FROM {TABLE}
             """)
-            # Salin kolom yang ada saja (jika tabel lama ada)
-            cur.execute(f"PRAGMA table_info({table_name})")
-            old_cols = [r[1] for r in cur.fetchall() if r[1] != "id"]
-            if old_cols:
-                cols_csv = ", ".join(old_cols)
-                cur.execute(f"INSERT INTO {table_name}_new ({cols_csv}) SELECT {cols_csv} FROM {table_name}")
-            cur.execute(f"ALTER TABLE {table_name} RENAME TO {table_name}_backup")
-            cur.execute(f"ALTER TABLE {table_name}_new RENAME TO {table_name}")
+            conn.execute(f"ALTER TABLE {TABLE} RENAME TO {TABLE}_backup")
+            conn.execute(f"ALTER TABLE {TABLE}_new RENAME TO {TABLE}")
             conn.commit()
-            st.success(f"Migrasi {table_name} selesai. Tabel lama disimpan sebagai _backup.")
+            st.success("Migrasi selesai. Tabel lama disimpan sebagai _backup.")
         except Exception as e:
             conn.rollback()
-            st.error(f"Migrasi {table_name} gagal: {e}")
+            st.error(f"Migrasi gagal: {e}")
         finally:
-            cur.execute("PRAGMA foreign_keys=ON")
+            conn.execute("PRAGMA foreign_keys=ON")
 
-def init_db(table_name: str):
+def migrate_from_legacy_tables():
+    """
+    OPSIONAL: Jika masih ada tabel lama:
+    - pasien_nonfaktor_inhibitor(jenis_penanganan, ketersediaan, jumlah_pengguna)
+    - pasien_nonfaktor_tanpa_inhibitor(jenis_penanganan, ketersediaan, jumlah_pengguna)
+    Maka fungsi ini akan mengagregasi jumlah_pengguna per (kode_organisasi, created_at persis)
+    lalu memasukkan totalnya ke tabel utama pasien_nonfaktor.
+    """
     with connect() as conn:
-        c = conn.cursor()
-        c.execute(f"""
-            CREATE TABLE IF NOT EXISTS {table_name} (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                kode_organisasi TEXT,
-                created_at TEXT NOT NULL,
-                jenis_penanganan TEXT,
-                ketersediaan TEXT,
-                jumlah_pengguna INTEGER,
-                FOREIGN KEY (kode_organisasi) REFERENCES identitas_organisasi(kode_organisasi)
+        if not (_table_exists(conn, LEGACY_INHIB) or _table_exists(conn, LEGACY_TANPA)):
+            return  # tidak ada tabel lama
+
+        st.info("Ditemukan tabel lama. Menjalankan migrasi agregasi ke tabel utama…")
+        create_main_schema(conn)  # pastikan ada
+
+        # siapkan subquery dengan aman (jika tabel tidak ada → nol baris)
+        inhib_q = (f"""
+            SELECT kode_organisasi, created_at, SUM(COALESCE(jumlah_pengguna,0)) AS total_inhib
+            FROM {LEGACY_INHIB}
+            GROUP BY kode_organisasi, created_at
+        """) if _table_exists(conn, LEGACY_INHIB) else "SELECT NULL AS kode_organisasi, NULL AS created_at, 0 AS total_inhib WHERE 0"
+        tanpa_q = (f"""
+            SELECT kode_organisasi, created_at, SUM(COALESCE(jumlah_pengguna,0)) AS total_tanpa
+            FROM {LEGACY_TANPA}
+            GROUP BY kode_organisasi, created_at
+        """) if _table_exists(conn, LEGACY_TANPA) else "SELECT NULL AS kode_organisasi, NULL AS created_at, 0 AS total_tanpa WHERE 0"
+
+        # gabung penuh sederhana dengan UNION lalu agregasi (menangani mismatch created_at)
+        df_agg = pd.read_sql_query(f"""
+            WITH a AS ({inhib_q}),
+                 b AS ({tanpa_q})
+            SELECT COALESCE(a.kode_organisasi, b.kode_organisasi) AS kode_organisasi,
+                   COALESCE(a.created_at, b.created_at) AS created_at,
+                   COALESCE(a.total_inhib, 0) AS total_inhib,
+                   COALESCE(b.total_tanpa, 0) AS total_tanpa
+            FROM a
+            FULL OUTER JOIN b
+            ON a.kode_organisasi = b.kode_organisasi AND a.created_at = b.created_at
+        """, conn)
+
+        if df_agg.empty:
+            st.info("Tidak ada data yang perlu dimigrasikan dari tabel lama.")
+            return
+
+        # insert ke tabel utama
+        cur = conn.cursor()
+        for _, r in df_agg.iterrows():
+            kode = r["kode_organisasi"]
+            created_at = r["created_at"] or datetime.utcnow().isoformat()
+            di = int(r.get("total_inhib") or 0)
+            ti = int(r.get("total_tanpa") or 0)
+            cur.execute(
+                f"INSERT INTO {TABLE} (kode_organisasi, created_at, dengan_inhibitor, tanpa_inhibitor) VALUES (?, ?, ?, ?)",
+                [kode, str(created_at), di, ti]
             )
-        """)
+        conn.commit()
+        st.success(f"Migrasi agregasi selesai: {len(df_agg)} baris dipindahkan ke {TABLE}.")
+
+def init_db():
+    with connect() as conn:
+        create_main_schema(conn)
         conn.commit()
 
-# ======================== Helpers umum ========================
+# ======================== Helpers ========================
 def load_hmhi_to_kode():
-    """
-    Ambil pilihan dari identitas_organisasi.hmhi_cabang dan petakan ke kode_organisasi.
-    Return:
-        mapping: dict {hmhi_cabang -> kode_organisasi}
-        options: list hmhi_cabang (urut alfabet)
-    """
     with connect() as conn:
         try:
             df = pd.read_sql_query(
@@ -113,51 +171,40 @@ def load_hmhi_to_kode():
             )
             if df.empty:
                 return {}, []
-            mapping = {}
-            for _, row in df.iterrows():
-                hmhi_val = (str(row["hmhi_cabang"]).strip() if pd.notna(row["hmhi_cabang"]) else "")
-                kode_val = (str(row["kode_organisasi"]).strip() if pd.notna(row["kode_organisasi"]) else "")
-                if hmhi_val:
-                    mapping[hmhi_val] = kode_val
-            options = sorted(mapping.keys())
-            return mapping, options
+            mapping = {str(r["hmhi_cabang"]).strip(): str(r["kode_organisasi"]).strip()
+                       for _, r in df.iterrows() if pd.notna(r["hmhi_cabang"]) and str(r["hmhi_cabang"]).strip()}
+            return mapping, sorted(mapping.keys())
         except Exception:
             return {}, []
 
-def safe_int(val):
+def _to_nonneg_int(v):
     try:
-        x = pd.to_numeric(val, errors="coerce")
+        x = pd.to_numeric(v, errors="coerce")
         if pd.isna(x):
             return 0
-        return int(x)
+        return max(int(x), 0)
     except Exception:
         return 0
 
-def insert_row(table_name: str, payload: dict, kode_organisasi: str):
+def insert_row(kode_organisasi: str, di: int, ti: int):
     with connect() as conn:
-        c = conn.cursor()
-        cols = ", ".join(payload.keys())
-        placeholders = ", ".join(["?"] * len(payload))
-        vals = [payload[k] for k in payload]
-        c.execute(
-            f"INSERT INTO {table_name} (kode_organisasi, created_at, {cols}) VALUES (?, ?, {placeholders})",
-            [kode_organisasi, datetime.utcnow().isoformat()] + vals
+        conn.execute(
+            f"INSERT INTO {TABLE} (kode_organisasi, created_at, dengan_inhibitor, tanpa_inhibitor) VALUES (?, ?, ?, ?)",
+            [kode_organisasi, datetime.utcnow().isoformat(), di, ti]
         )
         conn.commit()
 
-def read_with_kota(table_name: str, limit=500):
+def read_with_join(limit=500):
     with connect() as conn:
-        if not _has_column(conn, table_name, "kode_organisasi"):
-            st.error(f"Kolom 'kode_organisasi' belum tersedia di {table_name}. Coba refresh setelah migrasi.")
-            return pd.read_sql_query(f"SELECT * FROM {table_name} ORDER BY id DESC LIMIT ?", conn, params=[limit])
-
+        if not _has_column(conn, TABLE, "kode_organisasi"):
+            st.error("Kolom 'kode_organisasi' belum tersedia. Coba refresh setelah migrasi.")
+            return pd.read_sql_query(f"SELECT * FROM {TABLE} ORDER BY id DESC LIMIT ?", conn, params=[limit])
         return pd.read_sql_query(
             f"""
-            SELECT
-              t.id, t.kode_organisasi, t.created_at,
-              t.jenis_penanganan, t.ketersediaan, t.jumlah_pengguna,
-              io.hmhi_cabang, io.kota_cakupan_cabang
-            FROM {table_name} t
+            SELECT t.id, t.kode_organisasi, t.created_at,
+                   t.dengan_inhibitor, t.tanpa_inhibitor,
+                   io.hmhi_cabang, io.kota_cakupan_cabang
+            FROM {TABLE} t
             LEFT JOIN identitas_organisasi io ON io.kode_organisasi = t.kode_organisasi
             ORDER BY t.id DESC
             LIMIT ?
@@ -165,255 +212,84 @@ def read_with_kota(table_name: str, limit=500):
         )
 
 # ======================== Startup ========================
-for t in (TABLE_INHIB, TABLE_TANPA):
-    migrate_if_needed(t)
-    init_db(t)
+migrate_if_needed()
+init_db()
+# Jalankan sekali untuk migrasi dari tabel lama (abaikan jika tidak ada)
+migrate_from_legacy_tables()
 
 # ======================== UI ========================
 tab_input, tab_data = st.tabs(["📝 Input", "📄 Data"])
 
 with tab_input:
-    # -- Sumber pilihan dari HMHI cabang → mapped ke kode_organisasi
     hmhi_map, hmhi_list = load_hmhi_to_kode()
     if not hmhi_list:
         st.warning("Belum ada data Identitas Organisasi (kolom HMHI cabang).")
         selected_hmhi = None
     else:
-        selected_hmhi = st.selectbox(
-            "Pilih HMHI Cabang (Provinsi)",
-            options=hmhi_list,
-            key="nf::hmhi_select"
-        )
+        selected_hmhi = st.selectbox("Pilih HMHI Cabang (Provinsi)", options=hmhi_list, key="nf1::hmhi")
 
-    # --- Form 1: Dengan Inhibitor ---
-    st.subheader("1) Pasien Pengguna Nonfaktor Dengan Inhibitor")
-    df_inhib_default = pd.DataFrame({
-        "jenis_penanganan": ["", "", "", "", ""],
-        "ketersediaan": ["", "", "", "", ""],
-        "jumlah_pengguna": [0, 0, 0, 0, 0],
-    })
-    with st.form("nf::form_inhib"):
-        ed_inhib = st.data_editor(
-            df_inhib_default,
-            key="nf::editor_inhib",
-            column_config={
-                "jenis_penanganan": st.column_config.TextColumn("Jenis Penanganan", help="Contoh: Emicizumab profilaksis, rFVIIa, aPCC, dsb."),
-                "ketersediaan": st.column_config.SelectboxColumn(
-                    "Ketersediaan", options=["", "Tersedia", "Tidak tersedia"], required=False
-                ),
-                "jumlah_pengguna": st.column_config.NumberColumn("Jumlah Pengguna", min_value=0, step=1),
-            },
-            use_container_width=True,
-            num_rows="dynamic",
-            hide_index=True,
-        )
-        sub_inhib = st.form_submit_button("💾 Simpan (Dengan Inhibitor)")
+    col1, col2 = st.columns(2)
+    with col1:
+        di_val = st.number_input("Dengan inhibitor", min_value=0, step=1, value=0, key="nf1::di")
+    with col2:
+        ti_val = st.number_input("Tanpa inhibitor", min_value=0, step=1, value=0, key="nf1::ti")
 
-    if sub_inhib:
+    if st.button("💾 Simpan Total", type="primary", key="nf1::save"):
         if not selected_hmhi:
             st.error("Pilih HMHI cabang terlebih dahulu.")
         else:
-            kode_organisasi = hmhi_map.get(selected_hmhi)
-            if not kode_organisasi:
+            kode = hmhi_map.get(selected_hmhi)
+            if not kode:
                 st.error("Kode organisasi tidak ditemukan untuk HMHI cabang terpilih.")
+            elif di_val == 0 and ti_val == 0:
+                st.error("Minimal salah satu nilai > 0.")
             else:
-                n_saved = 0
-                for _, row in ed_inhib.iterrows():
-                    jenis = str(row.get("jenis_penanganan") or "").strip()
-                    ket = str(row.get("ketersediaan") or "").strip()
-                    jml = safe_int(row.get("jumlah_pengguna", 0))
-                    if not jenis and jml <= 0 and not ket:
-                        continue
-                    payload = {
-                        "jenis_penanganan": jenis,
-                        "ketersediaan": ket,
-                        "jumlah_pengguna": jml,
-                    }
-                    insert_row(TABLE_INHIB, payload, kode_organisasi)
-                    n_saved += 1
-                if n_saved > 0:
-                    st.success(f"{n_saved} baris tersimpan (Dengan Inhibitor) untuk **{selected_hmhi}**.")
-                else:
-                    st.info("Tidak ada baris valid untuk disimpan (Dengan Inhibitor).")
+                insert_row(kode, _to_nonneg_int(di_val), _to_nonneg_int(ti_val))
+                st.success(f"Data tersimpan untuk **{selected_hmhi}**.")
 
-    st.divider()
-
-    # --- Form 2: Tanpa Inhibitor ---
-    st.subheader("2) Pasien Pengguna Nonfaktor Tanpa Inhibitor")
-    df_tanpa_default = pd.DataFrame({
-        "jenis_penanganan": ["", "", "", "", ""],
-        "ketersediaan": ["", "", "", "", ""],
-        "jumlah_pengguna": [0, 0, 0, 0, 0],
-    })
-    with st.form("nf::form_tanpa"):
-        ed_tanpa = st.data_editor(
-            df_tanpa_default,
-            key="nf::editor_tanpa",
-            column_config={
-                "jenis_penanganan": st.column_config.TextColumn("Jenis Penanganan", help="Contoh: Emicizumab profilaksis, rFVIIa, aPCC, dsb."),
-                "ketersediaan": st.column_config.SelectboxColumn(
-                    "Ketersediaan", options=["", "Tersedia", "Tidak tersedia"], required=False
-                ),
-                "jumlah_pengguna": st.column_config.NumberColumn("Jumlah Pengguna", min_value=0, step=1),
-            },
-            use_container_width=True,
-            num_rows="dynamic",
-            hide_index=True,
-        )
-        sub_tanpa = st.form_submit_button("💾 Simpan (Tanpa Inhibitor)")
-
-    if sub_tanpa:
-        if not selected_hmhi:
-            st.error("Pilih HMHI cabang terlebih dahulu.")
-        else:
-            kode_organisasi = hmhi_map.get(selected_hmhi)
-            if not kode_organisasi:
-                st.error("Kode organisasi tidak ditemukan untuk HMHI cabang terpilih.")
-            else:
-                n_saved = 0
-                for _, row in ed_tanpa.iterrows():
-                    jenis = str(row.get("jenis_penanganan") or "").strip()
-                    ket = str(row.get("ketersediaan") or "").strip()
-                    jml = safe_int(row.get("jumlah_pengguna", 0))
-                    if not jenis and jml <= 0 and not ket:
-                        continue
-                    payload = {
-                        "jenis_penanganan": jenis,
-                        "ketersediaan": ket,
-                        "jumlah_pengguna": jml,
-                    }
-                    insert_row(TABLE_TANPA, payload, kode_organisasi)
-                    n_saved += 1
-                if n_saved > 0:
-                    st.success(f"{n_saved} baris tersimpan (Tanpa Inhibitor) untuk **{selected_hmhi}**.")
-                else:
-                    st.info("Tidak ada baris valid untuk disimpan (Tanpa Inhibitor).")
-
-# ======================== Data Tersimpan & Unggah Excel ========================
 with tab_data:
-    # ---------- Template Excel ----------
-    st.caption("Gunakan template berikut saat mengunggah data (kolom harus persis sama):")
-    tmpl_rows = [
-        {"HMHI cabang": "", "Jenis Penanganan": "Emicizumab profilaksis", "Ketersediaan": "Tersedia", "Jumlah Pengguna": 0},
-        {"HMHI cabang": "", "Jenis Penanganan": "rFVIIa", "Ketersediaan": "", "Jumlah Pengguna": 0},
-    ]
-    tmpl_df = pd.DataFrame(tmpl_rows, columns=TEMPLATE_COLUMNS)
+    st.subheader("📄 Data Tersimpan")
+    df = read_with_join(limit=500)
+
+    # ===== Unduh Template Excel =====
+    st.caption("Template unggah (format ringkas sesuai skema baru).")
+    tmpl_df = pd.DataFrame([
+        {"HMHI cabang": "", "Dengan inhibitor": 0, "Tanpa inhibitor": 0},
+    ], columns=TEMPLATE_COLUMNS)
     buf_tmpl = io.BytesIO()
     with pd.ExcelWriter(buf_tmpl, engine="xlsxwriter") as w:
         tmpl_df.to_excel(w, index=False, sheet_name="Template")
-    st.download_button(
-        "📥 Unduh Template Excel",
-        buf_tmpl.getvalue(),
-        file_name="template_pasien_nonfaktor.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        key="nf::dl_template"
-    )
+    st.download_button("📥 Unduh Template Excel", buf_tmpl.getvalue(),
+                       file_name="template_pasien_nonfaktor_total.xlsx",
+                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                       key="nf1::dl_template")
 
-    # ---------- Data Tersimpan: Dengan Inhibitor ----------
-    st.subheader("📄 Data Tersimpan — Dengan Inhibitor")
-    df_inhib = read_with_kota(TABLE_INHIB, limit=500)
-    if df_inhib.empty:
-        st.info("Belum ada data (Dengan Inhibitor).")
+    if df.empty:
+        st.info("Belum ada data.")
     else:
-        cols_order = ["hmhi_cabang", "kota_cakupan_cabang", "created_at", "jenis_penanganan", "ketersediaan", "jumlah_pengguna"]
-        cols_order = [c for c in cols_order if c in df_inhib.columns]
-        view_inhib = df_inhib[cols_order].rename(columns={
+        view = df.rename(columns={
             "hmhi_cabang": "HMHI cabang",
             "kota_cakupan_cabang": "Kota/Provinsi Cakupan Cabang",
             "created_at": "Created At",
-            "jenis_penanganan": "Jenis Penanganan",
-            "ketersediaan": "Ketersediaan",
-            "jumlah_pengguna": "Jumlah Pengguna",
+            "dengan_inhibitor": "Dengan inhibitor",
+            "tanpa_inhibitor": "Tanpa inhibitor",
         })
-        st.dataframe(view_inhib, use_container_width=True)
+        order = ["HMHI cabang", "Kota/Provinsi Cakupan Cabang", "Created At", "Dengan inhibitor", "Tanpa inhibitor"]
+        order = [c for c in order if c in view.columns]
+        st.dataframe(view[order], use_container_width=True)
 
-        buf1 = io.BytesIO()
-        with pd.ExcelWriter(buf1, engine="xlsxwriter") as w:
-            view_inhib.to_excel(w, index=False, sheet_name="Nonfaktor_Inhibitor")
-        st.download_button(
-            "⬇️ Unduh Excel (Dengan Inhibitor)",
-            buf1.getvalue(),
-            file_name="pasien_nonfaktor_dengan_inhibitor.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            key="nf::download_inhib"
-        )
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine="xlsxwriter") as w:
+            view[order].to_excel(w, index=False, sheet_name="PasienNonfaktor")
+        st.download_button("⬇️ Unduh Excel (Data Tersimpan)", buf.getvalue(),
+                           file_name="pasien_nonfaktor_total.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                           key="nf1::download")
 
-    st.divider()
-
-    # ---------- Data Tersimpan: Tanpa Inhibitor ----------
-    st.subheader("📄 Data Tersimpan — Tanpa Inhibitor")
-    df_tanpa = read_with_kota(TABLE_TANPA, limit=500)
-    if df_tanpa.empty:
-        st.info("Belum ada data (Tanpa Inhibitor).")
-    else:
-        cols_order = ["hmhi_cabang", "kota_cakupan_cabang", "created_at", "jenis_penanganan", "ketersediaan", "jumlah_pengguna"]
-        cols_order = [c for c in cols_order if c in df_tanpa.columns]
-        view_tanpa = df_tanpa[cols_order].rename(columns={
-            "hmhi_cabang": "HMHI cabang",
-            "kota_cakupan_cabang": "Kota/Provinsi Cakupan Cabang",
-            "created_at": "Created At",
-            "jenis_penanganan": "Jenis Penanganan",
-            "ketersediaan": "Ketersediaan",
-            "jumlah_pengguna": "Jumlah Pengguna",
-        })
-        st.dataframe(view_tanpa, use_container_width=True)
-
-        buf2 = io.BytesIO()
-        with pd.ExcelWriter(buf2, engine="xlsxwriter") as w:
-            view_tanpa.to_excel(w, index=False, sheet_name="Nonfaktor_TanpaInhibitor")
-        st.download_button(
-            "⬇️ Unduh Excel (Tanpa Inhibitor)",
-            buf2.getvalue(),
-            file_name="pasien_nonfaktor_tanpa_inhibitor.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            key="nf::download_tanpa"
-        )
-
-    st.divider()
+    # ===== Unggah Excel =====
     st.markdown("### ⬆️ Unggah Excel")
-    up = st.file_uploader(
-        "Pilih file Excel (.xlsx) dengan header persis seperti template",
-        type=["xlsx"],
-        key="nf::uploader"
-    )
-
-    def process_upload(df_up: pd.DataFrame, target_table: str):
-        """Proses & simpan DataFrame unggah ke tabel target."""
-        hmhi_map, _ = load_hmhi_to_kode()
-        results = []
-        n_ok = 0
-
-        for i in range(len(df_up)):
-            try:
-                s = df_up.iloc[i]  # Series, agar .get tersedia
-                hmhi = str((s.get("hmhi_cabang_info") or "")).strip()
-                if not hmhi:
-                    raise ValueError("Kolom 'HMHI cabang' kosong.")
-                kode_organisasi = hmhi_map.get(hmhi)
-                if not kode_organisasi:
-                    raise ValueError(f"HMHI cabang '{hmhi}' tidak ditemukan di identitas_organisasi.")
-
-                jenis = str((s.get("jenis_penanganan") or "")).strip()
-                ket = str((s.get("ketersediaan") or "")).strip()
-                jml = safe_int(s.get("jumlah_pengguna", 0))
-
-                if not jenis and jml <= 0 and not ket:
-                    # baris kosong → lewati tapi tidak error
-                    results.append({"Baris Excel": i + 2, "Status": "LEWATI", "Keterangan": "Baris kosong / tidak ada data"})
-                    continue
-
-                payload = {
-                    "jenis_penanganan": jenis,
-                    "ketersediaan": ket,
-                    "jumlah_pengguna": max(jml, 0),
-                }
-                insert_row(target_table, payload, kode_organisasi)
-                results.append({"Baris Excel": i + 2, "Status": "OK", "Keterangan": f"Simpan → {hmhi}"})
-                n_ok += 1
-            except Exception as e:
-                results.append({"Baris Excel": i + 2, "Status": "GAGAL", "Keterangan": str(e)})
-
-        return pd.DataFrame(results), n_ok
+    up = st.file_uploader("Pilih file Excel (.xlsx) dengan header persis seperti template",
+                          type=["xlsx"], key="nf1::uploader")
 
     if up is not None:
         try:
@@ -423,50 +299,56 @@ with tab_data:
             st.error(f"Gagal membaca file: {e}")
             st.stop()
 
-        # Validasi header
         missing = [c for c in TEMPLATE_COLUMNS if c not in raw.columns]
         if missing:
             st.error("Header kolom tidak sesuai. Kolom yang belum ada: " + ", ".join(missing))
             st.stop()
 
-        # Pratinjau
         st.caption("Pratinjau 20 baris pertama dari file yang diunggah:")
         st.dataframe(raw.head(20), use_container_width=True)
 
         df_up = raw.rename(columns=ALIAS_TO_DB).copy()
 
-        # Pilih target tabel lewat radio
-        target = st.radio(
-            "Simpan data ke tabel:",
-            options=("Dengan Inhibitor", "Tanpa Inhibitor"),
-            horizontal=True,
-            key="nf::target_table"
-        )
+        if st.button("🚀 Proses & Simpan", type="primary", key="nf1::process"):
+            hmhi_map, _ = load_hmhi_to_kode()
+            results = []
+            ok = fail = 0
 
-        if st.button("🚀 Proses & Simpan", type="primary", key="nf::process"):
-            target_table = TABLE_INHIB if target == "Dengan Inhibitor" else TABLE_TANPA
-            res_df, n_ok = process_upload(df_up, target_table)
+            for i in range(len(df_up)):
+                try:
+                    s = df_up.iloc[i]
+                    hmhi = str((s.get("hmhi_cabang_info") or "")).strip()
+                    if not hmhi:
+                        raise ValueError("Kolom 'HMHI cabang' kosong.")
+                    kode = hmhi_map.get(hmhi)
+                    if not kode:
+                        raise ValueError(f"HMHI cabang '{hmhi}' tidak ditemukan di identitas_organisasi.")
+
+                    di = _to_nonneg_int(s.get("dengan_inhibitor"))
+                    ti = _to_nonneg_int(s.get("tanpa_inhibitor"))
+                    if di == 0 and ti == 0:
+                        raise ValueError("Minimal salah satu dari 'Dengan inhibitor' atau 'Tanpa inhibitor' harus > 0.")
+
+                    insert_row(kode, di, ti)
+                    results.append({"Baris Excel": i + 2, "Status": "OK", "Keterangan": f"Simpan → {hmhi} (DI={di}, TI={ti})"})
+                    ok += 1
+                except Exception as e:
+                    results.append({"Baris Excel": i + 2, "Status": "GAGAL", "Keterangan": str(e)})
+                    fail += 1
+
+            res_df = pd.DataFrame(results)
             st.write("**Hasil unggah:**")
             st.dataframe(res_df, use_container_width=True)
 
-            ok = (res_df["Status"] == "OK").sum()
-            fail = (res_df["Status"] == "GAGAL").sum()
-            skip = (res_df["Status"] == "LEWATI").sum()
             if ok:
                 st.success(f"Berhasil menyimpan {ok} baris.")
-            if skip:
-                st.info(f"Dilewati {skip} baris kosong.")
             if fail:
                 st.error(f"Gagal menyimpan {fail} baris.")
 
-            # Unduh log hasil
             log_buf = io.BytesIO()
             with pd.ExcelWriter(log_buf, engine="xlsxwriter") as w:
                 res_df.to_excel(w, index=False, sheet_name="Hasil")
-            st.download_button(
-                "📄 Unduh Log Hasil",
-                log_buf.getvalue(),
-                file_name=f"log_hasil_unggah_pasien_nonfaktor_{'inhib' if target_table==TABLE_INHIB else 'tanpa'}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                key="nf::dl_log"
-            )
+            st.download_button("📄 Unduh Log Hasil", log_buf.getvalue(),
+                               file_name="log_hasil_unggah_pasien_nonfaktor_total.xlsx",
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                               key="nf1::dl_log")
