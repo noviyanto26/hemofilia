@@ -15,21 +15,9 @@ st.title("🏥 Rumah Sakit yang Menangani Hemofilia")
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = str((BASE_DIR / "hemofilia.db").resolve())
 
-TABLE = "rs_penangan_hemofilia"  # skema mengikuti Postgres
-
-# ===== Template unggah (sesuai FK & kolom Postgres) =====
-TEMPLATE_COLUMNS = [
-    "HMHI cabang",  # ke kode_organisasi
-    "Kode RS",      # FK ke rumah_sakit.kode_rs
-    "Layanan",
-    "Catatan",
-]
-ALIAS_TO_DB = {
-    "HMHI cabang": "hmhi_cabang_info",
-    "Kode RS": "kode_rs",
-    "Layanan": "layanan",
-    "Catatan": "catatan",
-}
+TABLE_RS_PENANGAN = "rs_penangan_hemofilia"
+TABLE_RS_MASTER = "rumah_sakit"
+TABLE_ORG = "identitas_organisasi"
 
 # ======================== Util DB ========================
 def connect():
@@ -37,16 +25,10 @@ def connect():
     conn.execute("PRAGMA foreign_keys=ON")
     return conn
 
-def _table_exists(conn, name: str) -> bool:
-    cur = conn.cursor()
-    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (name,))
-    return cur.fetchone() is not None
-
 def ensure_identitas_schema():
-    """Pastikan tabel identitas_organisasi ada (minimal kolom yang dipakai UI)."""
     with connect() as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS identitas_organisasi (
+        conn.execute(f"""
+            CREATE TABLE IF NOT EXISTS {TABLE_ORG} (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 kode_organisasi TEXT UNIQUE,
                 hmhi_cabang TEXT,
@@ -56,45 +38,45 @@ def ensure_identitas_schema():
         conn.commit()
 
 def ensure_rumah_sakit_schema():
-    """Pastikan master rumah_sakit selaras dengan Postgres."""
+    """Selaras dengan skema Postgres."""
     with connect() as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS rumah_sakit (
+        conn.execute(f"""
+            CREATE TABLE IF NOT EXISTS {TABLE_RS_MASTER} (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                kode_rs TEXT UNIQUE,
-                nama_rs TEXT NOT NULL,
-                provinsi TEXT,
-                kota TEXT,
-                tipe_rs TEXT,
-                kelas_rs TEXT,
-                kontak TEXT
+                kode_rs   TEXT UNIQUE NOT NULL,
+                nama_rs   TEXT NOT NULL,
+                provinsi  TEXT,
+                kota      TEXT,
+                tipe_rs   TEXT,
+                kelas_rs  TEXT,
+                kontak    TEXT
             )
         """)
         conn.commit()
 
-def init_rs_penangan_schema():
-    """Skema utama mengikuti Postgres: rs_penangan_hemofilia."""
+def ensure_rs_penangan_schema():
+    """Tabel transaksi RS penangan hemofilia (mengikuti Postgres)."""
     with connect() as conn:
         conn.execute(f"""
-            CREATE TABLE IF NOT EXISTS {TABLE} (
+            CREATE TABLE IF NOT EXISTS {TABLE_RS_PENANGAN} (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 kode_organisasi TEXT,
                 kode_rs TEXT,
-                d_at TEXT NOT NULL,     -- gunakan ISO UTC, ekuivalen now() at time zone UTC
+                d_at TEXT NOT NULL,
                 layanan TEXT,
                 catatan TEXT,
-                FOREIGN KEY (kode_organisasi) REFERENCES identitas_organisasi(kode_organisasi),
-                FOREIGN KEY (kode_rs) REFERENCES rumah_sakit(kode_rs)
+                FOREIGN KEY (kode_organisasi) REFERENCES {TABLE_ORG}(kode_organisasi),
+                FOREIGN KEY (kode_rs) REFERENCES {TABLE_RS_MASTER}(kode_rs)
             )
         """)
         conn.commit()
 
 # ======================== Helpers ========================
 def load_hmhi_to_kode():
-    """Map hmhi_cabang -> kode_organisasi dari identitas_organisasi."""
+    """Map hmhi_cabang -> kode_organisasi."""
     with connect() as conn:
         df = pd.read_sql_query(
-            "SELECT kode_organisasi, hmhi_cabang FROM identitas_organisasi ORDER BY id DESC",
+            f"SELECT kode_organisasi, hmhi_cabang FROM {TABLE_ORG} ORDER BY id DESC",
             conn
         )
     if df.empty:
@@ -108,11 +90,10 @@ def load_hmhi_to_kode():
     return mapping, sorted(mapping.keys())
 
 def load_rs_master():
-    """Ambil master RS + buat label pilihan."""
     with connect() as conn:
         try:
             df = pd.read_sql_query(
-                "SELECT kode_rs, nama_rs, kota, provinsi, tipe_rs, kelas_rs FROM rumah_sakit ORDER BY nama_rs",
+                f"SELECT kode_rs, nama_rs, kota, provinsi, tipe_rs, kelas_rs FROM {TABLE_RS_MASTER} ORDER BY nama_rs",
                 conn
             )
         except Exception:
@@ -121,27 +102,24 @@ def load_rs_master():
     df["nama_rs"] = df["nama_rs"].astype(str).str.strip()
     df["kota"] = df["kota"].astype(str).str.strip()
     df["provinsi"] = df["provinsi"].astype(str).str.strip()
-
-    # label tampilan: "KODE — NAMA RS (Kota, Provinsi)"
+    # Label tampilan
     df["label"] = df.apply(
-        lambda r: f"{r['kode_rs']} — {r['nama_rs']}" +
-                  (f" ({r['kota']}, {r['provinsi']})" if r["kota"] or r["provinsi"] else ""),
+        lambda r: f"{r['kode_rs']} — {r['nama_rs']}"
+                  + (f" ({r['kota']}, {r['provinsi']})" if r["kota"] or r["provinsi"] else ""),
         axis=1
     )
     label_to_kode = {row["label"]: row["kode_rs"] for _, row in df.iterrows()}
-    kode_to_label = {row["kode_rs"]: row["label"] for _, row in df.iterrows()}
-    return df, label_to_kode, kode_to_label
+    return df, label_to_kode
 
-def insert_row(kode_organisasi: str, kode_rs: str, layanan: str, catatan: str):
+def insert_rs_penangan(kode_organisasi: str, kode_rs: str, layanan: str, catatan: str):
     with connect() as conn:
         conn.execute(
-            f"INSERT INTO {TABLE} (kode_organisasi, kode_rs, d_at, layanan, catatan) VALUES (?, ?, ?, ?, ?)",
+            f"INSERT INTO {TABLE_RS_PENANGAN} (kode_organisasi, kode_rs, d_at, layanan, catatan) VALUES (?, ?, ?, ?, ?)",
             [kode_organisasi, kode_rs, datetime.utcnow().isoformat(), layanan, catatan]
         )
         conn.commit()
 
-def read_with_join(limit=500):
-    """Join untuk tampilan kaya informasi."""
+def read_rs_penangan_with_join(limit=500):
     with connect() as conn:
         return pd.read_sql_query(
             f"""
@@ -149,48 +127,174 @@ def read_with_join(limit=500):
               t.id, t.d_at, t.layanan, t.catatan,
               t.kode_organisasi, io.hmhi_cabang, io.kota_cakupan_cabang,
               t.kode_rs, rs.nama_rs, rs.kota, rs.provinsi, rs.tipe_rs, rs.kelas_rs, rs.kontak
-            FROM {TABLE} t
-            LEFT JOIN identitas_organisasi io ON io.kode_organisasi = t.kode_organisasi
-            LEFT JOIN rumah_sakit rs ON rs.kode_rs = t.kode_rs
+            FROM {TABLE_RS_PENANGAN} t
+            LEFT JOIN {TABLE_ORG} io ON io.kode_organisasi = t.kode_organisasi
+            LEFT JOIN {TABLE_RS_MASTER} rs ON rs.kode_rs = t.kode_rs
             ORDER BY t.id DESC
             LIMIT ?
             """,
             conn, params=[limit]
         )
 
+def insert_master_rs_rows(rows: list[dict], upsert: bool):
+    """
+    rows: [{kode_rs, nama_rs, provinsi, kota, tipe_rs, kelas_rs, kontak}]
+    upsert: True -> ON CONFLICT(kode_rs) DO UPDATE
+    """
+    if not rows:
+        return 0, []
+    sql = f"""
+        INSERT INTO {TABLE_RS_MASTER} (kode_rs, nama_rs, provinsi, kota, tipe_rs, kelas_rs, kontak)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """
+    if upsert:
+        sql += """
+        ON CONFLICT(kode_rs) DO UPDATE SET
+          nama_rs=excluded.nama_rs,
+          provinsi=excluded.provinsi,
+          kota=excluded.kota,
+          tipe_rs=excluded.tipe_rs,
+          kelas_rs=excluded.kelas_rs,
+          kontak=excluded.kontak
+        """
+    ok, logs = 0, []
+    with connect() as conn:
+        cur = conn.cursor()
+        for r in rows:
+            try:
+                cur.execute(sql, [
+                    r.get("kode_rs"), r.get("nama_rs"), r.get("provinsi"),
+                    r.get("kota"), r.get("tipe_rs"), r.get("kelas_rs"), r.get("kontak")
+                ])
+                ok += 1
+                logs.append(("OK", r.get("kode_rs"), "Tersimpan"))
+            except Exception as e:
+                logs.append(("GAGAL", r.get("kode_rs"), str(e)))
+        conn.commit()
+    return ok, logs
+
 # ======================== Startup ========================
 ensure_identitas_schema()
 ensure_rumah_sakit_schema()
-init_rs_penangan_schema()
+ensure_rs_penangan_schema()
 
 # ======================== UI ========================
-tab_input, tab_data = st.tabs(["📝 Input (Editor Tabel)", "📄 Data & Excel"])
+tab_input, tab_data, tab_master = st.tabs([
+    "📝 Input RS Penangan", "📄 Data & Excel", "🏥 Master Rumah Sakit"
+])
 
-# ---------- TAB INPUT ----------
+# ---------- TAB MASTER (Inline saat master kosong) ----------
+with tab_master:
+    st.subheader("🏥 Master Rumah Sakit")
+    st.caption("Isi/ubah data master RS. **Kode RS** harus unik. Gunakan upsert untuk update cepat.")
+
+    df_now, _ = load_rs_master()
+    mode = st.radio(
+        "Mode simpan:",
+        options=["Tambah baru (hindari duplikat)", "Upsert (update jika Kode RS sudah ada)"],
+        horizontal=True,
+        key="rs_master::mode"
+    )
+    upsert = (mode == "Upsert (update jika Kode RS sudah ada)")
+
+    # Editor master
+    default_rows = 8 if df_now.empty else 3
+    df_default = pd.DataFrame({
+        "kode_rs": ["" for _ in range(default_rows)],
+        "nama_rs": ["" for _ in range(default_rows)],
+        "provinsi": ["" for _ in range(default_rows)],
+        "kota": ["" for _ in range(default_rows)],
+        "tipe_rs": ["" for _ in range(default_rows)],
+        "kelas_rs": ["" for _ in range(default_rows)],
+        "kontak": ["" for _ in range(default_rows)],
+    })
+
+    with st.form("rs_master::form_editor"):
+        edited = st.data_editor(
+            df_default,
+            key="rs_master::editor",
+            column_config={
+                "kode_rs": st.column_config.TextColumn("Kode RS", help="Wajib unik (contoh: RS-001)"),
+                "nama_rs": st.column_config.TextColumn("Nama RS", help="Wajib diisi"),
+                "provinsi": st.column_config.TextColumn("Provinsi"),
+                "kota": st.column_config.TextColumn("Kota"),
+                "tipe_rs": st.column_config.TextColumn("Tipe RS"),
+                "kelas_rs": st.column_config.TextColumn("Kelas RS"),
+                "kontak": st.column_config.TextColumn("Kontak"),
+            },
+            use_container_width=True,
+            num_rows="dynamic",
+            hide_index=True,
+        )
+        save_master = st.form_submit_button("💾 Simpan Master RS")
+
+    if save_master:
+        rows = []
+        for _, r in edited.iterrows():
+            kode = str(r.get("kode_rs") or "").strip()
+            nama = str(r.get("nama_rs") or "").strip()
+            if not kode and not nama:
+                continue
+            if not kode:
+                st.error("Ada baris master tanpa **Kode RS**.")
+                st.stop()
+            if not nama:
+                st.error(f"Ada baris master Kode RS '{kode}' tapi **Nama RS** kosong.")
+                st.stop()
+            rows.append({
+                "kode_rs": kode,
+                "nama_rs": nama,
+                "provinsi": str(r.get("provinsi") or "").strip(),
+                "kota": str(r.get("kota") or "").strip(),
+                "tipe_rs": str(r.get("tipe_rs") or "").strip(),
+                "kelas_rs": str(r.get("kelas_rs") or "").strip(),
+                "kontak": str(r.get("kontak") or "").strip(),
+            })
+        ok, logs = insert_master_rs_rows(rows, upsert=upsert)
+        if ok:
+            st.success(f"Berhasil menyimpan {ok} baris master RS.")
+        if logs:
+            st.dataframe(pd.DataFrame(logs, columns=["Status", "Kode RS", "Keterangan"]), use_container_width=True)
+
+    st.divider()
+    st.subheader("📄 Data Master Saat Ini")
+    df_master_now, _ = load_rs_master()
+    if df_master_now.empty:
+        st.info("Master rumah_sakit masih kosong.")
+    else:
+        v = df_master_now.rename(columns={
+            "kode_rs": "Kode RS", "nama_rs": "Nama RS",
+            "provinsi": "Provinsi", "kota": "Kota",
+            "tipe_rs": "Tipe RS", "kelas_rs": "Kelas RS"
+        })
+        st.dataframe(v[["Kode RS", "Nama RS", "Kota", "Provinsi", "Tipe RS", "Kelas RS"]], use_container_width=True)
+
+# ---------- TAB INPUT RS PENANGAN ----------
 with tab_input:
-    st.caption("Pilih HMHI cabang, lalu isi beberapa baris RS (berdasarkan **Kode RS** dari master).")
+    st.caption("Isi data RS penangan hemofilia per HMHI cabang (gunakan **Kode RS** dari master).")
+
     hmhi_map, hmhi_list = load_hmhi_to_kode()
-    df_rs, label_to_kode, kode_to_label = load_rs_master()
+    df_rs, label_to_kode = load_rs_master()
 
     if not hmhi_list:
-        st.warning("Belum ada data **identitas_organisasi**. Isi dulu HMHI cabang & kode_organisasi.")
+        st.warning("Belum ada data **identitas_organisasi**. Isi HMHI cabang & kode_organisasi dulu di tabel identitas.")
         selected_hmhi = None
     else:
         selected_hmhi = st.selectbox("Pilih HMHI Cabang (Provinsi)", options=hmhi_list, key="rs::hmhi")
 
+    # — Perbaikan utama: JANGAN blokir jika master kosong.
+    #    Tampilkan editor master inline di tab Master; di sini hanya info.
     if df_rs.empty:
-        st.error("Master **rumah_sakit** kosong. Tambahkan data RS (kode_rs, nama_rs, dst.) terlebih dahulu.")
-        st.stop()
+        st.warning("Master **rumah_sakit** kosong. Tambahkan data di tab **🏥 Master Rumah Sakit** terlebih dahulu.")
+    option_labels = [""] + sorted(label_to_kode.keys())
 
-    # Editor: pilih via label (agar user bisa melihat nama & lokasi), tapi yang disimpan adalah KODE RS.
+    # Editor input transaksi
     default_rows = 5
     df_default = pd.DataFrame({
-        "rs_label": [""] * default_rows,  # tampil di UI
+        "rs_label": [""] * default_rows,
         "layanan": [""] * default_rows,
         "catatan": [""] * default_rows,
     })
-
-    option_labels = [""] + sorted(label_to_kode.keys())
 
     with st.form("rs::form_editor"):
         edited = st.data_editor(
@@ -201,16 +305,17 @@ with tab_input:
                     "Rumah Sakit (Kode — Nama RS (Kota, Provinsi))",
                     options=option_labels, required=False
                 ),
-                "layanan": st.column_config.TextColumn("Layanan", help="Teks bebas, contoh: 'Klinik hemofilia; IGD 24 jam'"),
-                "catatan": st.column_config.TextColumn("Catatan", help="Opsional"),
+                "layanan": st.column_config.TextColumn("Layanan", help="Contoh: Klinik hemofilia; IGD 24 jam"),
+                "catatan": st.column_config.TextColumn("Catatan (opsional)"),
             },
             use_container_width=True,
             num_rows="dynamic",
             hide_index=True,
+            disabled=df_rs.empty  # disable jika master kosong
         )
 
-        # Pratinjau hasil simpan (pecah label → kode_rs & nama rs)
-        if not edited.empty:
+        # Pratinjau baris yang akan disimpan
+        if not edited.empty and not df_rs.empty:
             preview = []
             for _, r in edited.iterrows():
                 lbl = str(r.get("rs_label") or "").strip()
@@ -229,7 +334,7 @@ with tab_input:
             st.caption("Pratinjau baris yang akan disimpan:")
             st.dataframe(pd.DataFrame(preview), use_container_width=True)
 
-        submitted = st.form_submit_button("💾 Simpan")
+        submitted = st.form_submit_button("💾 Simpan", disabled=df_rs.empty)
 
     if submitted:
         if not selected_hmhi:
@@ -250,7 +355,7 @@ with tab_input:
                         continue
                     layanan = str(r.get("layanan") or "").strip()
                     catatan = str(r.get("catatan") or "").strip()
-                    insert_row(kode_organisasi, kode_rs, layanan, catatan)
+                    insert_rs_penangan(kode_organisasi, kode_rs, layanan, catatan)
                     n_saved += 1
                 if n_saved:
                     st.success(f"{n_saved} baris tersimpan untuk **{selected_hmhi}**.")
@@ -260,7 +365,7 @@ with tab_input:
 # ---------- TAB DATA ----------
 with tab_data:
     st.subheader("📄 Data Tersimpan")
-    df = read_with_join(limit=500)
+    df = read_rs_penangan_with_join(limit=500)
 
     if df.empty:
         st.info("Belum ada data.")
@@ -298,108 +403,3 @@ with tab_data:
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             key="rs::download"
         )
-
-    st.divider()
-    st.markdown("### 📥 Template & Unggah Excel")
-
-    # Template kosong untuk unggah
-    tmpl_df = pd.DataFrame([{
-        "HMHI cabang": "",
-        "Kode RS": (df_rs.iloc[0]["kode_rs"] if not df_rs.empty else ""),
-        "Layanan": "",
-        "Catatan": "",
-    }], columns=TEMPLATE_COLUMNS)
-    buf_tmpl = io.BytesIO()
-    with pd.ExcelWriter(buf_tmpl, engine="xlsxwriter") as w:
-        tmpl_df.to_excel(w, index=False, sheet_name="Template")
-    st.download_button(
-        "📄 Unduh Template Excel",
-        buf_tmpl.getvalue(),
-        file_name="template_rs_penangan_hemofilia.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        key="rs::dl_template"
-    )
-
-    # Unggah
-    up = st.file_uploader("Unggah file Excel (.xlsx) sesuai template", type=["xlsx"], key="rs::uploader")
-
-    def process_upload(df_up: pd.DataFrame):
-        """Validasi & simpan unggahan. Return (log_df, n_ok)."""
-        hmhi_map, _ = load_hmhi_to_kode()
-        results, n_ok = [], 0
-
-        for i in range(len(df_up)):
-            try:
-                s = df_up.iloc[i]
-                hmhi = str((s.get("hmhi_cabang_info") or "")).strip()
-                if not hmhi:
-                    raise ValueError("Kolom 'HMHI cabang' kosong.")
-                kode_organisasi = hmhi_map.get(hmhi)
-                if not kode_organisasi:
-                    raise ValueError(f"HMHI cabang '{hmhi}' tidak ditemukan di identitas_organisasi.")
-
-                kode_rs = str((s.get("kode_rs") or "")).strip()
-                if not kode_rs:
-                    raise ValueError("Kolom 'Kode RS' kosong.")
-                # validasi kode_rs ada di master
-                if df_rs[df_rs["kode_rs"].str.casefold() == kode_rs.casefold()].empty:
-                    raise ValueError(f"Kode RS '{kode_rs}' tidak ada di master rumah_sakit.")
-
-                layanan = str((s.get("layanan") or "")).strip()
-                catatan = str((s.get("catatan") or "")).strip()
-
-                insert_row(kode_organisasi, kode_rs, layanan, catatan)
-                results.append({"Baris Excel": i + 2, "Status": "OK", "Keterangan": f"Simpan → {hmhi} / {kode_rs}"})
-                n_ok += 1
-            except Exception as e:
-                results.append({"Baris Excel": i + 2, "Status": "GAGAL", "Keterangan": str(e)})
-
-        return pd.DataFrame(results), n_ok
-
-    if up is not None:
-        try:
-            raw = pd.read_excel(up)
-            raw.columns = [str(c).strip() for c in raw.columns]
-        except Exception as e:
-            st.error(f"Gagal membaca file: {e}")
-            st.stop()
-
-        # Validasi header minimal
-        missing = [c for c in ["HMHI cabang", "Kode RS"] if c not in raw.columns]
-        if missing:
-            st.error("Header kolom tidak sesuai. Minimal harus ada: " + ", ".join(missing))
-            st.stop()
-
-        # Tambahkan kolom opsional agar aman
-        for c in TEMPLATE_COLUMNS:
-            if c not in raw.columns:
-                raw[c] = ""
-
-        st.caption("Pratinjau 20 baris pertama:")
-        st.dataframe(raw[TEMPLATE_COLUMNS].head(20), use_container_width=True)
-
-        df_up = raw.rename(columns=ALIAS_TO_DB).copy()
-
-        if st.button("🚀 Proses & Simpan Unggahan", type="primary", key="rs::process"):
-            log_df, n_ok = process_upload(df_up)
-            st.write("**Hasil unggah:**")
-            st.dataframe(log_df, use_container_width=True)
-
-            ok = (log_df["Status"] == "OK").sum()
-            fail = (log_df["Status"] == "GAGAL").sum()
-            if ok:
-                st.success(f"Berhasil menyimpan {ok} baris.")
-            if fail:
-                st.error(f"Gagal menyimpan {fail} baris.")
-
-            # Unduh log hasil
-            log_buf = io.BytesIO()
-            with pd.ExcelWriter(log_buf, engine="xlsxwriter") as w:
-                log_df.to_excel(w, index=False, sheet_name="Hasil")
-            st.download_button(
-                "📄 Unduh Log Hasil",
-                log_buf.getvalue(),
-                file_name="log_hasil_unggah_rs_penangan_hemofilia.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                key="rs::dl_log"
-            )
