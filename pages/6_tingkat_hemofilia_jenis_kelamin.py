@@ -1,14 +1,22 @@
-import streamlit as st
-import sqlite3
-import pandas as pd
-from datetime import datetime
+import os
 import io
+import sqlite3
+from datetime import datetime
+from pathlib import Path
 
+import pandas as pd
+import streamlit as st
+
+# =========================
+# Konfigurasi & Konstanta
+# =========================
 st.set_page_config(page_title="Tingkat Hemofilia & Jenis Kelamin", page_icon="🩸", layout="wide")
 st.title("🩸 Tingkat Hemofilia dan Jenis Kelamin")
 
-DB_PATH = "hemofilia.db"
-TABLE = "tingkat_hemofilia_jk"
+BASE_DIR = Path(__file__).resolve().parent
+DB_PATH = str((BASE_DIR / "hemofilia.db").resolve())
+
+TABLE = "tingkat_hemofilia_jenis_kelamin"   # ganti jika DB Anda sudah memakai nama lain
 
 SEVERITY_COLS = [
     ("ringan", "Ringan (>5%)"),
@@ -38,9 +46,13 @@ ALIAS_TO_DB = {
     "Total": "total",
 }
 
-# ======================== Util DB ========================
+# =========================
+# Utilitas Database
+# =========================
 def connect():
-    return sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
 
 def _has_column(conn, table, col):
     cur = conn.cursor()
@@ -52,19 +64,22 @@ def _table_exists(conn, table):
     cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,))
     return cur.fetchone() is not None
 
+# =========================
+# Migrasi Skema: selaraskan kolom
+# =========================
 def migrate_if_needed():
-    """Pastikan skema final tersedia (termasuk kode_organisasi & kolom angka)."""
+    """Pastikan skema final tersedia (kode_organisasi, label, angka-angka, total, is_total_row)."""
     with connect() as conn:
         if not _table_exists(conn, TABLE):
             return
-        needed = ["kode_organisasi", "label", "ringan", "sedang", "berat", "tidak_diketahui", "total", "is_total_row"]
+        needed = ["kode_organisasi", "label", "ringan", "sedang", "berat", "tidak_diketahui", "total", "is_total_row", "created_at"]
         cur = conn.cursor()
         cur.execute(f"PRAGMA table_info({TABLE})")
         have = [r[1] for r in cur.fetchall()]
         if all(col in have for col in needed):
             return
 
-        st.warning("Migrasi skema: menyesuaikan tabel Tingkat Hemofilia…")
+        st.warning("Migrasi skema: menyesuaikan tabel Tingkat Hemofilia & Jenis Kelamin…")
         cur.execute("PRAGMA foreign_keys=OFF")
         try:
             cur.execute(f"""
@@ -118,7 +133,9 @@ def init_db():
         """)
         conn.commit()
 
-# ======================== Helpers ========================
+# =========================
+# Helper CRUD & Loader
+# =========================
 def load_hmhi_to_kode():
     """
     Ambil pilihan dari identitas_organisasi.hmhi_cabang dan petakan ke kode_organisasi.
@@ -145,12 +162,12 @@ def load_hmhi_to_kode():
         except Exception:
             return {}, []
 
-def safe_int(val):
+def _to_nonneg_int(v):
     try:
-        x = pd.to_numeric(val, errors="coerce")
+        x = pd.to_numeric(v, errors="coerce")
         if pd.isna(x):
             return 0
-        return int(x)
+        return max(int(x), 0)
     except Exception:
         return 0
 
@@ -160,13 +177,14 @@ def insert_row(payload: dict, kode_organisasi: str):
         cols = ", ".join(payload.keys())
         placeholders = ", ".join(["?"] * len(payload))
         vals = [payload[k] for k in payload]
+        # created_at TEXT UTC ISO → aman untuk Excel (tanpa tz)
         c.execute(
             f"INSERT INTO {TABLE} (kode_organisasi, created_at, {cols}) VALUES (?, ?, {placeholders})",
             [kode_organisasi, datetime.utcnow().isoformat()] + vals
         )
         conn.commit()
 
-def read_with_kota(limit=500):
+def read_with_join(limit=500):
     with connect() as conn:
         if not _has_column(conn, TABLE, "kode_organisasi"):
             st.error("Kolom 'kode_organisasi' belum tersedia. Coba refresh setelah migrasi.")
@@ -182,18 +200,23 @@ def read_with_kota(limit=500):
             LEFT JOIN identitas_organisasi io ON io.kode_organisasi = t.kode_organisasi
             ORDER BY t.id DESC
             LIMIT ?
-            """, conn, params=[limit]
+            """,
+            conn, params=[limit]
         )
 
-# ======================== Startup ========================
+# =========================
+# Startup
+# =========================
 migrate_if_needed()
 init_db()
 
-# ======================== UI ========================
+# =========================
+# Antarmuka
+# =========================
 tab_input, tab_data = st.tabs(["📝 Input", "📄 Data"])
 
 with tab_input:
-    # 🔁 Sumber pilihan: hmhi_cabang → kode_organisasi
+    # Pilihan organisasi (HMHI → kode)
     hmhi_map, hmhi_list = load_hmhi_to_kode()
     if not hmhi_list:
         st.warning("Belum ada data Identitas Organisasi (kolom HMHI cabang).")
@@ -227,11 +250,11 @@ with tab_input:
         )
         # Total per baris (HA lk & HB lk)
         for row_label in ["Hemofilia A laki-laki", "Hemofilia B laki-laki"]:
-            ed_lk.loc[row_label, TOTAL_COL] = sum(safe_int(ed_lk.loc[row_label, c]) for c, _ in SEVERITY_COLS)
+            ed_lk.loc[row_label, TOTAL_COL] = sum(_to_nonneg_int(ed_lk.loc[row_label, c]) for c, _ in SEVERITY_COLS)
         # Baris Total Laki-laki = penjumlahan 2 baris di atas per kolom
         for c, _ in SEVERITY_COLS:
-            ed_lk.loc["Total Laki-laki", c] = safe_int(ed_lk.loc["Hemofilia A laki-laki", c]) + safe_int(ed_lk.loc["Hemofilia B laki-laki", c])
-        ed_lk.loc["Total Laki-laki", TOTAL_COL] = sum(safe_int(ed_lk.loc["Total Laki-laki", c]) for c, _ in SEVERITY_COLS)
+            ed_lk.loc["Total Laki-laki", c] = _to_nonneg_int(ed_lk.loc["Hemofilia A laki-laki", c]) + _to_nonneg_int(ed_lk.loc["Hemofilia B laki-laki", c])
+        ed_lk.loc["Total Laki-laki", TOTAL_COL] = sum(_to_nonneg_int(ed_lk.loc["Total Laki-laki", c]) for c, _ in SEVERITY_COLS)
 
         submit_lk = st.form_submit_button("💾 Simpan Data Laki-laki")
 
@@ -246,11 +269,11 @@ with tab_input:
                 for label in ed_lk.index.tolist():
                     payload = {
                         "label": label,
-                        "ringan": safe_int(ed_lk.loc[label, "ringan"]),
-                        "sedang": safe_int(ed_lk.loc[label, "sedang"]),
-                        "berat": safe_int(ed_lk.loc[label, "berat"]),
-                        "tidak_diketahui": safe_int(ed_lk.loc[label, "tidak_diketahui"]),
-                        "total": safe_int(ed_lk.loc[label, "total"]),
+                        "ringan": _to_nonneg_int(ed_lk.loc[label, "ringan"]),
+                        "sedang": _to_nonneg_int(ed_lk.loc[label, "sedang"]),
+                        "berat": _to_nonneg_int(ed_lk.loc[label, "berat"]),
+                        "tidak_diketahui": _to_nonneg_int(ed_lk.loc[label, "tidak_diketahui"]),
+                        "total": _to_nonneg_int(ed_lk.loc[label, "total"]),
                         "is_total_row": "1" if label.startswith("Total ") else "0",
                     }
                     insert_row(payload, kode_organisasi)
@@ -277,11 +300,11 @@ with tab_input:
         )
         # Total per baris (HA pr & HB pr)
         for row_label in ["Hemofilia A perempuan", "Hemofilia B perempuan"]:
-            ed_pr.loc[row_label, TOTAL_COL] = sum(safe_int(ed_pr.loc[row_label, c]) for c, _ in SEVERITY_COLS)
+            ed_pr.loc[row_label, TOTAL_COL] = sum(_to_nonneg_int(ed_pr.loc[row_label, c]) for c, _ in SEVERITY_COLS)
         # Baris Total Perempuan = penjumlahan 2 baris di atas per kolom
         for c, _ in SEVERITY_COLS:
-            ed_pr.loc["Total Perempuan", c] = safe_int(ed_pr.loc["Hemofilia A perempuan", c]) + safe_int(ed_pr.loc["Hemofilia B perempuan", c])
-        ed_pr.loc["Total Perempuan", TOTAL_COL] = sum(safe_int(ed_pr.loc["Total Perempuan", c]) for c, _ in SEVERITY_COLS)
+            ed_pr.loc["Total Perempuan", c] = _to_nonneg_int(ed_pr.loc["Hemofilia A perempuan", c]) + _to_nonneg_int(ed_pr.loc["Hemofilia B perempuan", c])
+        ed_pr.loc["Total Perempuan", TOTAL_COL] = sum(_to_nonneg_int(ed_pr.loc["Total Perempuan", c]) for c, _ in SEVERITY_COLS)
 
         submit_pr = st.form_submit_button("💾 Simpan Data Perempuan")
 
@@ -296,25 +319,26 @@ with tab_input:
                 for label in ed_pr.index.tolist():
                     payload = {
                         "label": label,
-                        "ringan": safe_int(ed_pr.loc[label, "ringan"]),
-                        "sedang": safe_int(ed_pr.loc[label, "sedang"]),
-                        "berat": safe_int(ed_pr.loc[label, "berat"]),
-                        "tidak_diketahui": safe_int(ed_pr.loc[label, "tidak_diketahui"]),
-                        "total": safe_int(ed_pr.loc[label, "total"]),
+                        "ringan": _to_nonneg_int(ed_pr.loc[label, "ringan"]),
+                        "sedang": _to_nonneg_int(ed_pr.loc[label, "sedang"]),
+                        "berat": _to_nonneg_int(ed_pr.loc[label, "berat"]),
+                        "tidak_diketahui": _to_nonneg_int(ed_pr.loc[label, "tidak_diketahui"]),
+                        "total": _to_nonneg_int(ed_pr.loc[label, "total"]),
                         "is_total_row": "1" if label.startswith("Total ") else "0",
                     }
                     insert_row(payload, kode_organisasi)
                 st.success(f"Data perempuan tersimpan untuk **{selected_hmhi}**.")
 
-# ======================== Data Tersimpan & Unggah Excel ========================
+# =========================
+# Data Tersimpan & Unggah Excel
+# =========================
 with tab_data:
     st.subheader("📄 Data Tersimpan")
-    df = read_with_kota(limit=500)
+    df = read_with_join(limit=500)
 
     # ====== Unduh Template Excel ======
     st.caption("Gunakan template berikut saat mengunggah data (kolom harus sesuai).")
     template_rows = [
-        # Contoh baris yang umum dipakai; boleh ditambah/dikurangi saat mengisi file
         {"HMHI cabang": "", "Baris": "Hemofilia A laki-laki", "Ringan (>5%)": 0, "Sedang (1-5%)": 0, "Berat (<1%)": 0, "Tidak diketahui": 0, "Total": 0},
         {"HMHI cabang": "", "Baris": "Hemofilia B laki-laki", "Ringan (>5%)": 0, "Sedang (1-5%)": 0, "Berat (<1%)": 0, "Tidak diketahui": 0, "Total": 0},
         {"HMHI cabang": "", "Baris": "Total Laki-laki", "Ringan (>5%)": 0, "Sedang (1-5%)": 0, "Berat (<1%)": 0, "Tidak diketahui": 0, "Total": 0},
@@ -329,7 +353,7 @@ with tab_data:
     st.download_button(
         "📥 Unduh Template Excel",
         buf_tmpl.getvalue(),
-        file_name="template_tingkat_hemofilia_jk.xlsx",
+        file_name="template_tingkat_hemofilia_jenis_kelamin.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         key="thjk::dl_template"
     )
@@ -413,21 +437,21 @@ with tab_data:
                     if not label:
                         raise ValueError("Kolom 'Baris' kosong.")
 
-                    ringan = safe_int(s.get("ringan"))
-                    sedang = safe_int(s.get("sedang"))
-                    berat = safe_int(s.get("berat"))
-                    td = safe_int(s.get("tidak_diketahui"))
-                    total = safe_int(s.get("total"))
+                    ringan = _to_nonneg_int(s.get("ringan"))
+                    sedang = _to_nonneg_int(s.get("sedang"))
+                    berat = _to_nonneg_int(s.get("berat"))
+                    td = _to_nonneg_int(s.get("tidak_diketahui"))
+                    total = _to_nonneg_int(s.get("total"))
                     if total == 0 and (ringan or sedang or berat or td):
                         total = ringan + sedang + berat + td
 
                     payload = {
                         "label": label,
-                        "ringan": max(ringan, 0),
-                        "sedang": max(sedang, 0),
-                        "berat": max(berat, 0),
-                        "tidak_diketahui": max(td, 0),
-                        "total": max(total, 0),
+                        "ringan": ringan,
+                        "sedang": sedang,
+                        "berat": berat,
+                        "tidak_diketahui": td,
+                        "total": total,
                         "is_total_row": "1" if label.strip().lower().startswith("total ") else "0",
                     }
                     insert_row(payload, kode_organisasi)
