@@ -9,8 +9,8 @@ import streamlit as st
 # =========================
 # Konfigurasi & Konstanta
 # =========================
-st.set_page_config(page_title="Pasien Nonfaktor (Satu Tabel)", page_icon="🩸", layout="wide")
-st.title("🩸 Pasien Pengguna Nonfaktor — Total Dengan & Tanpa Inhibitor (Satu Tabel)")
+st.set_page_config(page_title="Pasien Nonfaktor", page_icon="🩸", layout="wide")
+st.title("🩸 Pasien Pengguna Nonfaktor — Total Dengan & Tanpa Inhibitor")
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = str((BASE_DIR / "hemofilia.db").resolve())
@@ -29,11 +29,6 @@ def connect():
     conn = sqlite3.connect(DB_PATH)
     conn.execute("PRAGMA foreign_keys=ON")
     return conn
-
-def _table_exists(conn, name: str) -> bool:
-    cur = conn.cursor()
-    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (name,))
-    return cur.fetchone() is not None
 
 def _has_column(conn, table, col):
     cur = conn.cursor()
@@ -113,9 +108,10 @@ def read_with_join(limit=500):
 init_db()
 
 # ======================== UI ========================
-tab_input, tab_data = st.tabs(["📝 Input", "📄 Data"])
+tab_input, tab_data = st.tabs(["📝 Input (Editor Tabel)", "📄 Data"])
 
 with tab_input:
+    st.caption("Isi total pasien nonfaktor untuk satu HMHI cabang. Kolom **Total** dihitung otomatis.")
     hmhi_map, hmhi_list = load_hmhi_to_kode()
     if not hmhi_list:
         st.warning("Belum ada data Identitas Organisasi (kolom HMHI cabang).")
@@ -123,13 +119,34 @@ with tab_input:
     else:
         selected_hmhi = st.selectbox("Pilih HMHI Cabang (Provinsi)", options=hmhi_list, key="nf1::hmhi")
 
-    col1, col2 = st.columns(2)
-    with col1:
-        di_val = st.number_input("Dengan inhibitor", min_value=0, step=1, value=0, key="nf1::di")
-    with col2:
-        ti_val = st.number_input("Tanpa inhibitor", min_value=0, step=1, value=0, key="nf1::ti")
+    # === Editor berbasis tabel ===
+    df_default = pd.DataFrame(
+        [{"Dengan inhibitor": 0, "Tanpa inhibitor": 0, "Total": 0}],
+        index=["Input"]
+    )
+    col_cfg = {
+        "Dengan inhibitor": st.column_config.NumberColumn("Dengan inhibitor", min_value=0, step=1),
+        "Tanpa inhibitor": st.column_config.NumberColumn("Tanpa inhibitor", min_value=0, step=1),
+        "Total": st.column_config.NumberColumn("Total", min_value=0, step=1, disabled=True),
+    }
 
-    if st.button("💾 Simpan Total", type="primary", key="nf1::save"):
+    with st.form("nf1::form_editor"):
+        edited = st.data_editor(
+            df_default,
+            key="nf1::editor",
+            column_config=col_cfg,
+            use_container_width=True,
+            num_rows="fixed",
+        )
+
+        # Hitung total otomatis
+        di_val = _to_nonneg_int(edited.loc["Input", "Dengan inhibitor"])
+        ti_val = _to_nonneg_int(edited.loc["Input", "Tanpa inhibitor"])
+        edited.loc["Input", "Total"] = di_val + ti_val
+
+        submitted = st.form_submit_button("💾 Simpan")
+
+    if submitted:
         if not selected_hmhi:
             st.error("Pilih HMHI cabang terlebih dahulu.")
         else:
@@ -139,8 +156,8 @@ with tab_input:
             elif di_val == 0 and ti_val == 0:
                 st.error("Minimal salah satu nilai > 0.")
             else:
-                insert_row(kode, _to_nonneg_int(di_val), _to_nonneg_int(ti_val))
-                st.success(f"Data tersimpan untuk **{selected_hmhi}**.")
+                insert_row(kode, di_val, ti_val)
+                st.success(f"Data tersimpan untuk **{selected_hmhi}** (DI={di_val}, TI={ti_val}).")
 
 with tab_data:
     st.subheader("📄 Data Tersimpan")
@@ -206,8 +223,7 @@ with tab_data:
 
         if st.button("🚀 Proses & Simpan", type="primary", key="nf1::process"):
             hmhi_map, _ = load_hmhi_to_kode()
-            results = []
-            ok = fail = 0
+            results, ok, fail = [], 0, 0
 
             for i in range(len(df_up)):
                 try:
