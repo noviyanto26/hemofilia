@@ -7,14 +7,14 @@ import io
 st.set_page_config(page_title="Perkembangan Pelayanan Penanganan Hemofilia", page_icon="📈", layout="wide")
 st.title("📈 Perkembangan Pelayanan Penanganan Hemofilia")
 
-# ======================== Koneksi DB (Postgres via helper) ========================
-# Mengikuti pola referensi: gunakan helper dari db.py (Supabase)
-from db import fetch_df as pg_fetch_df, exec_sql as pg_exec_sql  # pastikan db.py tersedia pada repo/app
+# ======================== Koneksi DB (pakai helper seperti referensi) ========================
+# Mengikuti pola file referensi: import helper dari db.py
+from db import fetch_df as pg_fetch_df, exec_sql as pg_exec_sql  # <- sama seperti file "Identitas Organisasi"
 
 # ======================== Konstanta Tabel ========================
-TABLE_NAME  = "public.perkembangan_pelayanan_penanganan"
-IDENT_TABLE = "public.identitas_organisasi"
-RS_TABLE    = "public.rumah_sakit"
+TABLE_NAME = "public.perkembangan_pelayanan_penanganan"
+TABLE_ORG  = "public.identitas_organisasi"
+RS_TABLE   = "public.rumah_sakit"
 
 # ======================== Label Statis & Opsi ========================
 JENIS_LABELS = [
@@ -46,28 +46,31 @@ ALIAS_TO_DB = {
 
 # ======================== Helper Umum ========================
 def safe_int(val, default=0):
+    """Mengonversi nilai ke integer dengan aman."""
     try:
         x = pd.to_numeric(val, errors="coerce")
         if pd.isna(x):
             return default
         return int(x)
-    except Exception:
+    except (ValueError, TypeError):
         return default
 
 def load_org_map():
     """
-    Ambil mapping 'HMHI cabang' -> 'kode_organisasi' dari public.identitas_organisasi (Supabase).
-    Return:
+    Mengambil pemetaan 'HMHI cabang' -> 'kode_organisasi'.
+    Mengembalikan:
         mapping: dict {hmhi_cabang -> kode_organisasi}
-        options: list hmhi_cabang (urut)
+        options: list[str] hmhi_cabang (diurutkan)
     """
     try:
-        df = pg_fetch_df(f"""
+        df = pg_fetch_df(
+            f"""
             SELECT hmhi_cabang, kode_organisasi
-            FROM {IDENT_TABLE}
+            FROM {TABLE_ORG}
             WHERE COALESCE(hmhi_cabang, '') <> ''
             ORDER BY id DESC
-        """)
+            """
+        )
         if df.empty:
             return {}, []
         mapping = {}
@@ -82,15 +85,32 @@ def load_org_map():
 
 def load_rs_options():
     """
-    Ambil daftar RS dari public.rumah_sakit untuk pilihan "Nama - Lokasi - Propinsi".
-    Return:
-        option_labels: list label
-        label_to_parts: dict label -> {nama, lokasi, propinsi}
+    Mengambil daftar RS untuk SelectboxColumn.
+    Mengembalikan:
+        option_labels: list "Nama - Lokasi - Propinsi"
+        label_to_parts: dict untuk memetakan kembali label ke komponennya
     """
     try:
-        df_rs = pg_fetch_df(f"SELECT nama_rs AS Nama, kota AS Lokasi, provinsi AS Propinsi FROM {RS_TABLE} ORDER BY nama_rs")
+        # Gunakan alias ber-quote agar kolom persis: "Nama", "Lokasi", "Propinsi"
+        df_rs = pg_fetch_df(
+            f'''
+            SELECT
+              nama_rs AS "Nama",
+              kota    AS "Lokasi",
+              provinsi AS "Propinsi"
+            FROM {RS_TABLE}
+            ORDER BY nama_rs
+            '''
+        )
     except Exception:
         return [], {}
+
+    # fallback defensif bila (entah karena cache/driver) masih lowercase
+    cols = {c.lower(): c for c in df_rs.columns}
+    need = {"nama": "Nama", "lokasi": "Lokasi", "propinsi": "Propinsi"}
+    for k_lower, k_proper in need.items():
+        if k_proper not in df_rs.columns and k_lower in cols:
+            df_rs.rename(columns={cols[k_lower]: k_proper}, inplace=True)
 
     def to_str(x): return "" if pd.isna(x) else str(x).strip()
     label_to_parts = {}
@@ -101,25 +121,17 @@ def load_rs_options():
         label = f"{nama} - {lokasi or '-'} - {prop or '-'}"
         if label not in label_to_parts:
             label_to_parts[label] = {"nama": nama, "lokasi": lokasi, "propinsi": prop}
+
     return [""] + sorted(label_to_parts.keys()), label_to_parts
 
+# ======================== Helpers DB (insert / read) ========================
 def insert_row(payload: dict, kode_organisasi: str):
-    """
-    Insert 1 baris ke public.perkembangan_pelayanan_penanganan.
-    Kolom created_at memakai NOW() (server).
-    Skema kolom:
-      id, kode_organisasi, created_at, jenis, jumlah_terapi_gen, tahun,
-      nama_rumah_sakit, lokasi, propinsi
-    """
+    """Menyisipkan 1 baris data ke tabel utama (created_at menggunakan default NOW() di Postgres)."""
     sql = f"""
-        INSERT INTO {TABLE_NAME} (
-            kode_organisasi, created_at, jenis, jumlah_terapi_gen, tahun,
-            nama_rumah_sakit, lokasi, propinsi
-        )
-        VALUES (
-            :kode_organisasi, NOW(), :jenis, :jumlah_terapi_gen, :tahun,
-            :nama_rumah_sakit, :lokasi, :propinsi
-        )
+        INSERT INTO {TABLE_NAME}
+          (kode_organisasi, jenis, jumlah_terapi_gen, tahun, nama_rumah_sakit, lokasi, propinsi)
+        VALUES
+          (:kode_organisasi, :jenis, :jumlah_terapi_gen, :tahun, :nama_rumah_sakit, :lokasi, :propinsi)
     """
     params = {
         "kode_organisasi": kode_organisasi,
@@ -133,21 +145,18 @@ def insert_row(payload: dict, kode_organisasi: str):
     pg_exec_sql(sql, params)
 
 def read_with_org_info(limit=1000):
-    """Ambil data + join HMHI cabang dari identitas_organisasi (Supabase)."""
-    lim = int(limit)
+    """Mengambil data dan menggabungkannya dengan info organisasi."""
     q = f"""
         SELECT
-          t.id, t.kode_organisasi, t.created_at,
-          t.jenis, t.jumlah_terapi_gen, t.tahun,
+          t.id, t.created_at, t.jenis, t.jumlah_terapi_gen, t.tahun,
           t.nama_rumah_sakit, t.lokasi, t.propinsi,
           io.hmhi_cabang
         FROM {TABLE_NAME} t
-        LEFT JOIN {IDENT_TABLE} io
-          ON io.kode_organisasi = t.kode_organisasi
+        LEFT JOIN {TABLE_ORG} io ON io.kode_organisasi = t.kode_organisasi
         ORDER BY t.id DESC
-        LIMIT {lim}
+        LIMIT :lim
     """
-    return pg_fetch_df(q)
+    return pg_fetch_df(q, params={"lim": int(limit)})
 
 # ======================== UI ========================
 tab_input, tab_data = st.tabs(["📝 Input", "📄 Data"])
@@ -166,7 +175,7 @@ with tab_input:
 
     rs_option_labels, rs_label_to_parts = load_rs_options()
     if not rs_option_labels:
-        st.error("Master rumah_sakit kosong/terbaca kosong. Pastikan public.rumah_sakit berisi data.")
+        st.error("Gagal memuat daftar Rumah Sakit. Pastikan tabel public.rumah_sakit tersedia & berisi data.")
         st.stop()
 
     st.subheader("Form Perkembangan Pelayanan Penanganan Hemofilia")
@@ -190,7 +199,9 @@ with tab_input:
                 "jumlah_terapi_gen": st.column_config.NumberColumn("Jumlah Terapi Gen", min_value=0, step=1, format="%d"),
                 "tahun": st.column_config.NumberColumn("Tahun", min_value=1900, max_value=2100, step=1, format="%d"),
                 "nama_rumah_sakit": st.column_config.SelectboxColumn(
-                    "Nama Rumah Sakit (Nama - Lokasi - Propinsi)", options=rs_option_labels, required=False
+                    "Nama Rumah Sakit (Nama - Lokasi - Propinsi)",
+                    options=rs_option_labels,
+                    required=False
                 ),
             },
         )
@@ -206,16 +217,15 @@ with tab_input:
             else:
                 n_saved = 0
                 for _, row in ed.iterrows():
-                    jml = safe_int(row.get("jumlah_terapi_gen", 0))
-                    rs_label = str(row.get("nama_rumah_sakit") or "").strip()
-                    if jml == 0 and not rs_label:
-                        continue  # lewati baris kosong
+                    # lewati jika betul-betul kosong
+                    if safe_int(row.get("jumlah_terapi_gen", 0)) == 0 and not row.get("nama_rumah_sakit"):
+                        continue
 
-                    rs_parts = rs_label_to_parts.get(rs_label, {})
+                    rs_parts = rs_label_to_parts.get(str(row.get("nama_rumah_sakit") or ""), {})
                     payload = {
                         "jenis": row.get("jenis"),
-                        "jumlah_terapi_gen": jml,
-                        "tahun": safe_int(row.get("tahun"), datetime.utcnow().year),
+                        "jumlah_terapi_gen": row.get("jumlah_terapi_gen"),
+                        "tahun": row.get("tahun"),
                         "nama_rumah_sakit": rs_parts.get("nama"),
                         "lokasi": rs_parts.get("lokasi"),
                         "propinsi": rs_parts.get("propinsi"),
@@ -224,7 +234,7 @@ with tab_input:
                         insert_row(payload, kode_organisasi)
                         n_saved += 1
                     except Exception as e:
-                        st.error(f"Gagal menyimpan baris ({payload.get('jenis')}): {e}")
+                        st.error(f"Gagal menyimpan baris ({payload['jenis']}): {e}")
 
                 if n_saved > 0:
                     st.success(f"{n_saved} baris tersimpan untuk **{selected_hmhi}**.")
@@ -243,8 +253,7 @@ with tab_data:
         st.info("Belum ada data tersimpan.")
     else:
         cols_order = [
-            "hmhi_cabang", "created_at", "jenis",
-            "jumlah_terapi_gen", "tahun",
+            "hmhi_cabang", "created_at", "jenis", "jumlah_terapi_gen", "tahun",
             "nama_rumah_sakit", "lokasi", "propinsi"
         ]
         cols_order = [c for c in cols_order if c in df.columns]
@@ -258,11 +267,6 @@ with tab_data:
             "lokasi": "Lokasi",
             "propinsi": "Propinsi",
         })
-
-        # Hindari problem timezone saat ekspor Excel
-        if "Waktu Input" in view.columns:
-            view["Waktu Input"] = view["Waktu Input"].astype(str)
-
         st.dataframe(view, use_container_width=True)
 
         buf = io.BytesIO()
@@ -276,7 +280,6 @@ with tab_data:
             key="ppph::download_data"
         )
 
-    # ======================== Template & Unggah ========================
     st.divider()
     st.markdown("### 📥 Template & Unggah Excel")
 
@@ -300,7 +303,11 @@ with tab_data:
         key="ppph::dl_template"
     )
 
-    up = st.file_uploader("Unggah file Excel (.xlsx) sesuai template", type=["xlsx"], key="ppph::uploader")
+    up = st.file_uploader(
+        "Unggah file Excel (.xlsx) sesuai template",
+        type=["xlsx"],
+        key="ppph::uploader"
+    )
 
     def process_upload(df_up: pd.DataFrame):
         org_map, _ = load_org_map()
@@ -314,22 +321,19 @@ with tab_data:
                 if not kode_organisasi:
                     raise ValueError(f"HMHI cabang '{hmhi}' tidak ditemukan.")
 
-                jml = safe_int(s.get("jumlah_terapi_gen", 0))
-                nama_rs = str((s.get("nama_rumah_sakit") or "")).strip()
-                jenis = str((s.get("jenis") or "")).strip()
-
-                # lewati baris benar-benar kosong
-                if jml == 0 and not nama_rs and not jenis:
+                if safe_int(s.get("jumlah_terapi_gen", 0)) == 0 \
+                   and not str(s.get("nama_rumah_sakit") or "").strip() \
+                   and not str(s.get("jenis") or "").strip():
                     results.append({"Baris Excel": i + 2, "Status": "LEWAT", "Keterangan": "Baris kosong — dilewati"})
                     continue
 
                 payload = {
-                    "jenis": jenis,
-                    "jumlah_terapi_gen": jml,
-                    "tahun": safe_int(s.get("tahun"), datetime.utcnow().year),
-                    "nama_rumah_sakit": nama_rs,
-                    "lokasi": str((s.get("lokasi") or "")).strip(),
-                    "propinsi": str((s.get("propinsi") or "")).strip(),
+                    "jenis": str(s.get("jenis") or "").strip(),
+                    "jumlah_terapi_gen": safe_int(s.get("jumlah_terapi_gen", 0)),
+                    "tahun": safe_int(s.get("tahun", datetime.utcnow().year)),
+                    "nama_rumah_sakit": str(s.get("nama_rumah_sakit") or "").strip(),
+                    "lokasi": str(s.get("lokasi") or "").strip(),
+                    "propinsi": str(s.get("propinsi") or "").strip(),
                 }
                 insert_row(payload, kode_organisasi)
                 info = f"Simpan → {hmhi} / {payload['jenis'] or '(tanpa jenis)'}"
@@ -351,7 +355,6 @@ with tab_data:
             st.error("Header kolom tidak sesuai. Minimal harus ada 'HMHI cabang'.")
             st.stop()
 
-        # Lengkapi kolom yang hilang agar aman
         for c in TEMPLATE_COLUMNS:
             if c not in raw.columns:
                 raw[c] = 0 if c in ("Jumlah Terapi Gen", "Tahun") else ""
@@ -368,14 +371,16 @@ with tab_data:
             st.write("**Hasil unggah:**")
             st.dataframe(log_df, use_container_width=True)
 
-            ok  = (log_df["Status"] == "OK").sum()
+            ok = (log_df["Status"] == "OK").sum()
             fail = (log_df["Status"] == "GAGAL").sum()
             skip = (log_df["Status"] == "LEWAT").sum()
-            if ok:   st.success(f"Berhasil menyimpan {ok} baris.")
-            if fail: st.error(f"Gagal menyimpan {fail} baris.")
-            if skip: st.info(f"Dilewati {skip} baris kosong.")
+            if ok:
+                st.success(f"Berhasil menyimpan {ok} baris.")
+            if fail:
+                st.error(f"Gagal menyimpan {fail} baris.")
+            if skip:
+                st.info(f"Dilewati {skip} baris kosong.")
 
-            # Unduh log hasil
             log_buf = io.BytesIO()
             with pd.ExcelWriter(log_buf, engine="xlsxwriter") as w:
                 log_df.to_excel(w, index=False, sheet_name="Hasil_Unggah")
