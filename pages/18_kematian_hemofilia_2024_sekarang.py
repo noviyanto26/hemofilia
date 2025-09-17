@@ -1,5 +1,4 @@
 import streamlit as st
-import sqlite3
 import pandas as pd
 from datetime import datetime
 import io
@@ -8,197 +7,92 @@ import io
 st.set_page_config(page_title="Kematian Penyandang Hemofilia (2024–Sekarang)", page_icon="🕯️", layout="wide")
 st.title("🕯️ Jumlah Kematian Penyandang Hemofilia (1 Januari 2024–Sekarang)")
 
-DB_PATH = "hemofilia.db"
-TABLE = "kematian_hemofilia_2024kini"
+# ======================== Koneksi DB (Supabase/Postgres) ========================
+# Mengikuti referensi: gunakan helper dari db.py
+from db import fetch_df as pg_fetch_df, exec_sql as pg_exec_sql  # memastikan url/engine diatur terpusat
 
-# ======================== Util DB umum ========================
-def connect():
-    return sqlite3.connect(DB_PATH)
+TABLE = "public.kematian_hemofilia_2024kini"
+TABLE_ORG = "public.identitas_organisasi"
 
-def _table_exists(conn, table):
-    cur = conn.cursor()
-    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,))
-    return cur.fetchone() is not None
-
-def _has_column(conn, table, col):
-    cur = conn.cursor()
-    cur.execute(f"PRAGMA table_info({table})")
-    return any((row[1] == col) for row in cur.fetchall())
-
-def _get_first_existing_col(conn, table, candidates):
-    """Kembalikan nama kolom pertama yang ada dari kandidat; None jika tak ada."""
-    cur = conn.cursor()
-    try:
-        cur.execute(f"PRAGMA table_info({table})")
-        cols = [r[1] for r in cur.fetchall()]
-        for c in candidates:
-            if c in cols:
-                return c
-    except Exception:
-        pass
-    return None
-
-def migrate_if_needed(table_name: str):
+# ======================== Helpers DB ========================
+def insert_row(payload: dict, kode_organisasi: str):
     """
-    Skema final:
-      id, kode_organisasi, created_at,
-      penyebab_kematian, perdarahan, gangguan_hati, hiv, penyebab_lain, tahun_kematian
+    Insert baris baru. created_at diisi NOW() (timestamp server).
+    Kolom: id, kode_organisasi, created_at, penyebab_kematian, perdarahan, gangguan_hati, hiv, penyebab_lain, tahun_kematian
     """
-    with connect() as conn:
-        cur = conn.cursor()
-        if not _table_exists(conn, table_name):
-            return
-        needed = [
-            "kode_organisasi", "penyebab_kematian", "perdarahan",
-            "gangguan_hati", "hiv", "penyebab_lain", "tahun_kematian",
-        ]
-        cur.execute(f"PRAGMA table_info({table_name})")
-        have = [r[1] for r in cur.fetchall()]
-        if all(col in have for col in needed):
-            return  # sudah sesuai
+    sql = f"""
+        INSERT INTO {TABLE}
+            (kode_organisasi, created_at,
+             penyebab_kematian, perdarahan, gangguan_hati, hiv, penyebab_lain, tahun_kematian)
+        VALUES
+            (:kode_organisasi, NOW(),
+             :penyebab_kematian, :perdarahan, :gangguan_hati, :hiv, :penyebab_lain, :tahun_kematian)
+    """
+    params = {
+        "kode_organisasi": kode_organisasi,
+        "penyebab_kematian": payload.get("penyebab_kematian"),
+        "perdarahan": int(payload.get("perdarahan") or 0),
+        "gangguan_hati": int(payload.get("gangguan_hati") or 0),
+        "hiv": int(payload.get("hiv") or 0),
+        "penyebab_lain": payload.get("penyebab_lain"),
+        "tahun_kematian": int(payload.get("tahun_kematian") or 0),
+    }
+    pg_exec_sql(sql, params)
 
-        st.warning(f"Migrasi skema: menyesuaikan tabel {table_name} …")
-        cur.execute("PRAGMA foreign_keys=OFF")
-        try:
-            cur.execute(f"""
-                CREATE TABLE IF NOT EXISTS {table_name}_new (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    kode_organisasi TEXT,
-                    created_at TEXT NOT NULL,
-                    penyebab_kematian TEXT,
-                    perdarahan INTEGER,
-                    gangguan_hati INTEGER,
-                    hiv INTEGER,
-                    penyebab_lain TEXT,
-                    tahun_kematian INTEGER,
-                    FOREIGN KEY (kode_organisasi) REFERENCES identitas_organisasi(kode_organisasi)
-                )
-            """)
-            # Salin data lama (kolom yang ada)
-            cur.execute(f"PRAGMA table_info({table_name})")
-            old_cols = [r[1] for r in cur.fetchall() if r[1] != "id"]
-            if old_cols:
-                cols_csv = ", ".join(old_cols)
-                cur.execute(f"INSERT INTO {table_name}_new ({cols_csv}) SELECT {cols_csv} FROM {table_name}")
+def read_with_label(limit=1000) -> pd.DataFrame:
+    """
+    Ambil data + join label organisasi (hmhi_cabang) untuk tampilan.
+    """
+    lim = int(limit)
+    q = f"""
+        SELECT
+          t.id, t.kode_organisasi, t.created_at,
+          t.penyebab_kematian, t.perdarahan, t.gangguan_hati, t.hiv, t.penyebab_lain, t.tahun_kematian,
+          io.hmhi_cabang AS label_organisasi
+        FROM {TABLE} t
+        LEFT JOIN {TABLE_ORG} io ON io.kode_organisasi = t.kode_organisasi
+        ORDER BY t.id DESC
+        LIMIT {lim}
+    """
+    return pg_fetch_df(q)
 
-            # Tukar tabel
-            cur.execute(f"ALTER TABLE {table_name} RENAME TO {table_name}_backup")
-            cur.execute(f"ALTER TABLE {table_name}_new RENAME TO {table_name}")
-            conn.commit()
-            st.success(f"Migrasi {table_name} selesai. Tabel lama disimpan sebagai _backup.")
-        except Exception as e:
-            conn.rollback()
-            st.error(f"Migrasi {table_name} gagal: {e}")
-        finally:
-            cur.execute("PRAGMA foreign_keys=ON")
-
-def init_db(table_name: str):
-    with connect() as conn:
-        c = conn.cursor()
-        c.execute(f"""
-            CREATE TABLE IF NOT EXISTS {table_name} (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                kode_organisasi TEXT,
-                created_at TEXT NOT NULL,
-                penyebab_kematian TEXT,
-                perdarahan INTEGER,
-                gangguan_hati INTEGER,
-                hiv INTEGER,
-                penyebab_lain TEXT,
-                tahun_kematian INTEGER,
-                FOREIGN KEY (kode_organisasi) REFERENCES identitas_organisasi(kode_organisasi)
-            )
-        """)
-        conn.commit()
-
-def insert_row(table_name: str, payload: dict, kode_organisasi: str):
-    with connect() as conn:
-        c = conn.cursor()
-        cols = ", ".join(payload.keys())
-        placeholders = ", ".join(["?"] * len(payload))
-        vals = [payload[k] for k in payload]
-        c.execute(
-            f"INSERT INTO {table_name} (kode_organisasi, created_at, {cols}) VALUES (?, ?, {placeholders})",
-            [kode_organisasi, datetime.utcnow().isoformat()] + vals
-        )
-        conn.commit()
-
-def read_with_label(table_name: str, limit=1000):
-    """Ambil data + label organisasi (prioritas HMHI Cabang, fallback kota_cakupan_cabang)."""
-    with connect() as conn:
-        if not _has_column(conn, table_name, "kode_organisasi"):
-            st.error(f"Kolom 'kode_organisasi' belum tersedia di {table_name}. Coba refresh setelah migrasi.")
-            return pd.read_sql_query(f"SELECT * FROM {table_name} ORDER BY id DESC LIMIT ?", conn, params=[limit])
-
-        label_col = _get_first_existing_col(
-            conn, "identitas_organisasi",
-            ["HMHI_cabang", "hmhi_cabang", "HMHI cabang", "kota_cakupan_cabang"]
-        )
-        select_label = f"io.[{label_col}]" if label_col and " " in label_col else f"io.{label_col}" if label_col else "NULL"
-
-        return pd.read_sql_query(
-            f"""
-            SELECT
-              t.id, t.kode_organisasi, t.created_at,
-              t.penyebab_kematian, t.perdarahan, t.gangguan_hati, t.hiv, t.penyebab_lain, t.tahun_kematian,
-              {select_label} AS label_organisasi
-            FROM {table_name} t
-            LEFT JOIN identitas_organisasi io ON io.kode_organisasi = t.kode_organisasi
-            ORDER BY t.id DESC
-            LIMIT ?
-            """, conn, params=[limit]
-        )
-
-# ======================== Helpers UI/Input ========================
 def load_kode_organisasi_with_label():
-    """Mapping kode_organisasi -> 'HMHI Cabang' (tanpa kode). Duplikat → '(pilihan n)'."""
-    with connect() as conn:
-        try:
-            label_col = _get_first_existing_col(
-                conn, "identitas_organisasi",
-                ["HMHI_cabang", "hmhi_cabang", "HMHI cabang", "kota_cakupan_cabang"]
-            )
-            if label_col is None:
-                df = pd.read_sql_query("SELECT kode_organisasi FROM identitas_organisasi ORDER BY id DESC", conn)
-                if df.empty:
-                    return {}, []
-                return {row["kode_organisasi"]: "-" for _, row in df.iterrows()}, df["kode_organisasi"].tolist()
-
-            col_ref = f"[{label_col}]" if " " in label_col else label_col
-            df = pd.read_sql_query(
-                f"SELECT kode_organisasi, {col_ref} AS label FROM identitas_organisasi ORDER BY id DESC", conn
-            )
-            if df.empty:
-                return {}, []
-
-            labels = df["label"].fillna("-").astype(str).str.strip()
-            counts = labels.value_counts()
-            display, dup_index = [], {}
-            for lab in labels:
-                if counts[lab] == 1:
-                    display.append(lab)
-                else:
-                    i = dup_index.get(lab, 1)
-                    display.append(f"{lab} (pilihan {i})")
-                    dup_index[lab] = i + 1
-
-            mapping = {k: disp for k, disp in zip(df["kode_organisasi"], display)}
-            return mapping, df["kode_organisasi"].tolist()
-        except Exception:
+    """
+    Mapping kode_organisasi -> HMHI Cabang (tanpa kode). Jika duplikat label, diberi akhiran (pilihan n).
+    """
+    try:
+        df = pg_fetch_df(f"""
+            SELECT kode_organisasi, hmhi_cabang
+            FROM {TABLE_ORG}
+            ORDER BY id DESC
+        """)
+        if df.empty:
             return {}, []
 
+        labels = df["hmhi_cabang"].fillna("-").astype(str).str.strip()
+        counts = labels.value_counts()
+        display, dup_index = [], {}
+        for lab in labels:
+            if counts[lab] == 1:
+                display.append(lab)
+            else:
+                i = dup_index.get(lab, 1)
+                display.append(f"{lab} (pilihan {i})")
+                dup_index[lab] = i + 1
+
+        mapping = {k: disp for k, disp in zip(df["kode_organisasi"], display)}
+        return mapping, df["kode_organisasi"].tolist()
+    except Exception:
+        return {}, []
+
+# ======================== Helpers umum ========================
 def safe_int(val, default=0):
     try:
         x = pd.to_numeric(val, errors="coerce")
-        if pd.isna(x):
-            return default
+        if pd.isna(x): return default
         return int(x)
     except Exception:
         return default
-
-# ======================== Startup ========================
-migrate_if_needed(TABLE)
-init_db(TABLE)
 
 # ======================== Daftar label Penyebab ========================
 PENYEBAB_LABELS = [
@@ -258,7 +152,7 @@ with tab_input:
         )
         submit = st.form_submit_button("💾 Simpan")
 
-    # Simpan (skip baris kosong)
+    # Simpan (skip baris kosong total)
     if submit:
         if not kode_organisasi:
             st.error("Pilih organisasi terlebih dahulu.")
@@ -271,9 +165,11 @@ with tab_input:
                 hivv = safe_int(row.get("hiv", 0))
                 lain = str(row.get("penyebab_lain") or "").strip()
                 thn  = safe_int(row.get("tahun_kematian", 0))
+
                 if perd == 0 and hati == 0 and hivv == 0 and not lain:
                     skipped += 1
                     continue
+
                 payload = {
                     "penyebab_kematian": sebab,
                     "perdarahan": perd,
@@ -282,8 +178,12 @@ with tab_input:
                     "penyebab_lain": lain,
                     "tahun_kematian": thn,
                 }
-                insert_row(TABLE, payload, kode_organisasi)
-                n_saved += 1
+                try:
+                    insert_row(payload, kode_organisasi)
+                    n_saved += 1
+                except Exception as e:
+                    st.error(f"Gagal menyimpan baris ({sebab}): {e}")
+
             if n_saved > 0:
                 msg = f"{n_saved} baris tersimpan"
                 if skipped > 0:
@@ -366,7 +266,7 @@ with tab_data:
                     if not korg:
                         n_skip += 1
                         continue
-                    # Jika baris kosong total (angka 0, teks kosong) → lewati
+                    # Baris benar-benar kosong → lewati
                     if perd == 0 and hati == 0 and hivv == 0 and not lain and not sebab:
                         n_skip += 1
                         continue
@@ -379,7 +279,7 @@ with tab_data:
                         "penyebab_lain": lain,
                         "tahun_kematian": thn,
                     }
-                    insert_row(TABLE, payload, korg)
+                    insert_row(payload, korg)
                     n_ok += 1
 
                 if n_ok:
@@ -390,7 +290,7 @@ with tab_data:
             st.error(f"Gagal memproses file: {e}")
 
     # ====== Tampilkan data tersimpan ======
-    df = read_with_label(TABLE, limit=1000)
+    df = read_with_label(limit=1000)
     if df.empty:
         st.info("Belum ada data tersimpan.")
     else:
@@ -410,6 +310,11 @@ with tab_data:
             "penyebab_lain": "Penyebab lain",
             "tahun_kematian": "Tahun Kematian",
         })
+
+        # Hindari masalah serialisasi timezone saat ekspor
+        if "Created At" in view.columns:
+            view["Created At"] = view["Created At"].astype(str)
+
         st.dataframe(view, use_container_width=True)
 
         # Unduh data hasil gabung label
