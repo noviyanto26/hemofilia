@@ -1,190 +1,81 @@
 import streamlit as st
-import sqlite3
 import pandas as pd
-from datetime import datetime
 import io
 
 # ======================== Konfigurasi Halaman ========================
 st.set_page_config(page_title="Infeksi melalui Transfusi Darah", page_icon="🧬", layout="wide")
 st.title("🧬 Jumlah Penyandang Hemofilia Terinfeksi Penyakit Menular Melalui Transfusi Darah")
 
-DB_PATH = "hemofilia.db"
-TABLE = "infeksi_transfusi_darah"
+# ======================== Konektor Postgres (Supabase) ========================
+# Mengikuti pola referensi: gunakan helper dari db.py (sudah menangani st.secrets, engine, dll)
+from db import fetch_df as pg_fetch_df, exec_sql as pg_exec_sql  # ← sama seperti file referensi
 
-# ======================== Util DB umum ========================
-def connect():
-    return sqlite3.connect(DB_PATH)
+TABLE = "public.infeksi_transfusi_darah"
+TABLE_ORG = "public.identitas_organisasi"
 
-def _table_exists(conn, table):
-    cur = conn.cursor()
-    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,))
-    return cur.fetchone() is not None
+# ======================== Helper DB ========================
+def insert_row_pg(payload: dict, kode_organisasi: str):
+    """
+    Insert 1 baris ke public.infeksi_transfusi_darah.
+    created_at diisi NOW() di server Postgres.
+    Skema kolom:
+      id, kode_organisasi, created_at, kasus, jml_hepatitis_c, jml_hiv, penyakit_menular_lainnya
+    """
+    sql = f"""
+        INSERT INTO {TABLE}
+            (kode_organisasi, created_at, kasus, jml_hepatitis_c, jml_hiv, penyakit_menular_lainnya)
+        VALUES
+            (:kode_organisasi, NOW(), :kasus, :jml_hepatitis_c, :jml_hiv, :penyakit_menular_lainnya)
+    """
+    params = {
+        "kode_organisasi": kode_organisasi,
+        "kasus": payload.get("kasus"),
+        "jml_hepatitis_c": int(payload.get("jml_hepatitis_c") or 0),
+        "jml_hiv": int(payload.get("jml_hiv") or 0),
+        "penyakit_menular_lainnya": payload.get("penyakit_menular_lainnya"),
+    }
+    pg_exec_sql(sql, params)
 
-def _has_column(conn, table, col):
-    cur = conn.cursor()
-    cur.execute(f"PRAGMA table_info({table})")
-    return any((row[1] == col) for row in cur.fetchall())
+def read_with_label_pg(limit=1000):
+    """
+    Ambil data + label organisasi (hmhi_cabang dan/atau kota_cakupan_cabang).
+    """
+    lim = int(limit)
+    sql = f"""
+        SELECT
+          t.id, t.kode_organisasi, t.created_at,
+          t.kasus, t.jml_hepatitis_c, t.jml_hiv, t.penyakit_menular_lainnya,
+          io.hmhi_cabang AS label_organisasi
+        FROM {TABLE} t
+        LEFT JOIN {TABLE_ORG} io ON io.kode_organisasi = t.kode_organisasi
+        ORDER BY t.id DESC
+        LIMIT :lim
+    """
+    return pg_fetch_df(sql, {"lim": lim})
 
-def _get_first_existing_col(conn, table, candidates):
-    """Kembalikan nama kolom pertama yang ada dari kandidat; None jika tak ada."""
-    cur = conn.cursor()
+def load_kode_organisasi_with_label_pg():
+    """
+    Ambil mapping kode_organisasi -> label (hmhi_cabang). Jika kosong, tampilkan '-'.
+    """
     try:
-        cur.execute(f"PRAGMA table_info({table})")
-        cols = [r[1] for r in cur.fetchall()]
-        for c in candidates:
-            if c in cols:
-                return c
-    except Exception:
-        pass
-    return None
-
-def migrate_if_needed(table_name: str):
-    with connect() as conn:
-        cur = conn.cursor()
-        if not _table_exists(conn, table_name):
-            return
-
-        needed = ["kode_organisasi", "kasus", "jml_hepatitis_c", "jml_hiv", "penyakit_menular_lainnya"]
-        cur.execute(f"PRAGMA table_info({table_name})")
-        have = [r[1] for r in cur.fetchall()]
-        if all(col in have for col in needed):
-            return  # sudah sesuai
-
-        st.warning(f"Migrasi skema: menyesuaikan tabel {table_name} …")
-        cur.execute("PRAGMA foreign_keys=OFF")
-        try:
-            cur.execute(f"""
-                CREATE TABLE IF NOT EXISTS {table_name}_new (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    kode_organisasi TEXT,
-                    created_at TEXT NOT NULL,
-                    kasus TEXT,
-                    jml_hepatitis_c INTEGER,
-                    jml_hiv INTEGER,
-                    penyakit_menular_lainnya TEXT,
-                    FOREIGN KEY (kode_organisasi) REFERENCES identitas_organisasi(kode_organisasi)
-                )
-            """)
-            # Salin data lama
-            cur.execute(f"PRAGMA table_info({table_name})")
-            old_cols = [r[1] for r in cur.fetchall() if r[1] != "id"]
-            if old_cols:
-                cols_csv = ", ".join(old_cols)
-                cur.execute(f"INSERT INTO {table_name}_new ({cols_csv}) SELECT {cols_csv} FROM {table_name}")
-
-            cur.execute(f"ALTER TABLE {table_name} RENAME TO {table_name}_backup")
-            cur.execute(f"ALTER TABLE {table_name}_new RENAME TO {table_name}")
-            conn.commit()
-            st.success(f"Migrasi {table_name} selesai. Tabel lama disimpan sebagai _backup.")
-        except Exception as e:
-            conn.rollback()
-            st.error(f"Migrasi {table_name} gagal: {e}")
-        finally:
-            cur.execute("PRAGMA foreign_keys=ON")
-
-def init_db(table_name: str):
-    with connect() as conn:
-        c = conn.cursor()
-        c.execute(f"""
-            CREATE TABLE IF NOT EXISTS {table_name} (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                kode_organisasi TEXT,
-                created_at TEXT NOT NULL,
-                kasus TEXT,
-                jml_hepatitis_c INTEGER,
-                jml_hiv INTEGER,
-                penyakit_menular_lainnya TEXT,
-                FOREIGN KEY (kode_organisasi) REFERENCES identitas_organisasi(kode_organisasi)
-            )
+        df = pg_fetch_df(f"""
+            SELECT kode_organisasi, COALESCE(NULLIF(hmhi_cabang,''), '-') AS label
+            FROM {TABLE_ORG}
+            ORDER BY id DESC
         """)
-        conn.commit()
-
-def insert_row(table_name: str, payload: dict, kode_organisasi: str):
-    with connect() as conn:
-        c = conn.cursor()
-        cols = ", ".join(payload.keys())
-        placeholders = ", ".join(["?"] * len(payload))
-        vals = [payload[k] for k in payload]
-        c.execute(
-            f"INSERT INTO {table_name} (kode_organisasi, created_at, {cols}) VALUES (?, ?, {placeholders})",
-            [kode_organisasi, datetime.utcnow().isoformat()] + vals
-        )
-        conn.commit()
-
-def read_with_label(table_name: str, limit=1000):
-    """Ambil data + label organisasi (prioritas HMHI Cabang, fallback kota_cakupan_cabang)."""
-    with connect() as conn:
-        if not _has_column(conn, table_name, "kode_organisasi"):
-            st.error(f"Kolom 'kode_organisasi' belum tersedia di {table_name}.")
-            return pd.read_sql_query(f"SELECT * FROM {table_name} ORDER BY id DESC LIMIT ?", conn, params=[limit])
-
-        label_col = _get_first_existing_col(
-            conn, "identitas_organisasi",
-            ["HMHI_cabang", "hmhi_cabang", "HMHI cabang", "kota_cakupan_cabang"]
-        )
-        select_label = f"io.[{label_col}]" if label_col and " " in label_col else f"io.{label_col}" if label_col else "NULL"
-
-        return pd.read_sql_query(
-            f"""
-            SELECT
-              t.id, t.kode_organisasi, t.created_at,
-              t.kasus, t.jml_hepatitis_c, t.jml_hiv, t.penyakit_menular_lainnya,
-              {select_label} AS label_organisasi
-            FROM {table_name} t
-            LEFT JOIN identitas_organisasi io ON io.kode_organisasi = t.kode_organisasi
-            ORDER BY t.id DESC
-            LIMIT ?
-            """, conn, params=[limit]
-        )
-
-# ======================== Helpers UI/Input ========================
-def load_kode_organisasi_with_label():
-    """Mapping kode_organisasi -> HMHI Cabang (tanpa kode)."""
-    with connect() as conn:
-        try:
-            label_col = _get_first_existing_col(
-                conn, "identitas_organisasi",
-                ["HMHI_cabang", "hmhi_cabang", "HMHI cabang", "kota_cakupan_cabang"]
-            )
-            if label_col is None:
-                df = pd.read_sql_query("SELECT kode_organisasi FROM identitas_organisasi ORDER BY id DESC", conn)
-                if df.empty:
-                    return {}, []
-                return {row["kode_organisasi"]: "-" for _, row in df.iterrows()}, df["kode_organisasi"].tolist()
-
-            col_ref = f"[{label_col}]" if " " in label_col else label_col
-            df = pd.read_sql_query(f"SELECT kode_organisasi, {col_ref} AS label FROM identitas_organisasi ORDER BY id DESC", conn)
-            if df.empty:
-                return {}, []
-
-            labels = df["label"].fillna("-").astype(str).str.strip()
-            counts = labels.value_counts()
-            display, dup_index = [], {}
-            for lab in labels:
-                if counts[lab] == 1:
-                    display.append(lab)
-                else:
-                    i = dup_index.get(lab, 1)
-                    display.append(f"{lab} (pilihan {i})")
-                    dup_index[lab] = i + 1
-
-            mapping = {k: disp for k, disp in zip(df["kode_organisasi"], display)}
-            return mapping, df["kode_organisasi"].tolist()
-        except Exception:
+        if df.empty:
             return {}, []
+        mapping = {row["kode_organisasi"]: str(row["label"]) for _, row in df.iterrows()}
+        return mapping, df["kode_organisasi"].tolist()
+    except Exception:
+        return {}, []
 
 def safe_int(val, default=0):
     try:
         x = pd.to_numeric(val, errors="coerce")
-        if pd.isna(x):
-            return default
-        return int(x)
+        return default if pd.isna(x) else int(x)
     except Exception:
         return default
-
-# ======================== Startup ========================
-migrate_if_needed(TABLE)
-init_db(TABLE)
 
 # ======================== LABEL TETAP UNTUK "Kasus" ========================
 KASUS_LABELS = [
@@ -196,9 +87,9 @@ KASUS_LABELS = [
 tab_input, tab_data = st.tabs(["📝 Input", "📄 Data"])
 
 with tab_input:
-    mapping, kode_list = load_kode_organisasi_with_label()
+    mapping, kode_list = load_kode_organisasi_with_label_pg()
     if not kode_list:
-        st.warning("Belum ada data Identitas Organisasi.")
+        st.warning("Belum ada data Identitas Organisasi (public.identitas_organisasi).")
         kode_organisasi = None
     else:
         kode_organisasi = st.selectbox(
@@ -245,6 +136,7 @@ with tab_input:
                 hiv = safe_int(row.get("jml_hiv", 0))
                 lain = str(row.get("penyakit_menular_lainnya") or "").strip()
 
+                # lewati baris benar-benar kosong
                 if hc == 0 and hiv == 0 and not lain:
                     skipped += 1
                     continue
@@ -255,8 +147,11 @@ with tab_input:
                     "jml_hiv": hiv,
                     "penyakit_menular_lainnya": lain,
                 }
-                insert_row(TABLE, payload, kode_organisasi)
-                n_saved += 1
+                try:
+                    insert_row_pg(payload, kode_organisasi)
+                    n_saved += 1
+                except Exception as e:
+                    st.error(f"Gagal menyimpan baris ({kasus}): {e}")
 
             if n_saved > 0:
                 msg = f"{n_saved} baris tersimpan"
@@ -272,22 +167,15 @@ with tab_data:
     # ====== Unduh Template Excel ======
     st.markdown("#### 📄 Unduh Template Excel")
     tmpl_buf = io.BytesIO()
-    df_template = pd.DataFrame([
-        {
-            "kasus": "Kasus lama (sebelum 2024)",
-            "jml_hepatitis_c": 0,
-            "jml_hiv": 0,
-            "penyakit_menular_lainnya": "",
-            "kode_organisasi": "CAB001"
-        },
-        {
-            "kasus": "Kasus baru (2024/2025)",
-            "jml_hepatitis_c": 0,
-            "jml_hiv": 0,
-            "penyakit_menular_lainnya": "",
-            "kode_organisasi": "CAB002"
-        }
-    ], columns=["kasus", "jml_hepatitis_c", "jml_hiv", "penyakit_menular_lainnya", "kode_organisasi"])
+    df_template = pd.DataFrame(
+        [
+            {"kasus": "Kasus lama (sebelum 2024)", "jml_hepatitis_c": 0, "jml_hiv": 0,
+             "penyakit_menular_lainnya": "", "kode_organisasi": "CAB001"},
+            {"kasus": "Kasus baru (2024/2025)", "jml_hepatitis_c": 0, "jml_hiv": 0,
+             "penyakit_menular_lainnya": "", "kode_organisasi": "CAB002"},
+        ],
+        columns=["kasus", "jml_hepatitis_c", "jml_hiv", "penyakit_menular_lainnya", "kode_organisasi"]
+    )
     with pd.ExcelWriter(tmpl_buf, engine="xlsxwriter") as w:
         df_template.to_excel(w, index=False, sheet_name="Template_Infeksi_Transfusi")
     st.download_button(
@@ -302,52 +190,86 @@ with tab_data:
     st.markdown("### ⬆️ Unggah Excel (Impor Massal)")
     st.caption("File harus menyertakan semua kolom wajib.")
     up = st.file_uploader("Pilih file Excel (.xlsx)", type=["xlsx"], key="itd::uploader")
+
+    def process_upload(df_up: pd.DataFrame):
+        results, n_ok, n_skip = [], 0, 0
+        for i, r in df_up.iterrows():
+            try:
+                kasus = str(r.get("kasus") or "").strip()
+                hc = safe_int(r.get("jml_hepatitis_c", 0))
+                hiv = safe_int(r.get("jml_hiv", 0))
+                lain = str(r.get("penyakit_menular_lainnya") or "").strip()
+                korg = str(r.get("kode_organisasi") or "").strip()
+
+                if not korg:
+                    n_skip += 1
+                    results.append({"Baris Excel": i+2, "Status": "LEWAT", "Keterangan": "kode_organisasi kosong"})
+                    continue
+                if not kasus and hc == 0 and hiv == 0 and not lain:
+                    n_skip += 1
+                    results.append({"Baris Excel": i+2, "Status": "LEWAT", "Keterangan": "Baris kosong"})
+                    continue
+
+                insert_row_pg({
+                    "kasus": kasus,
+                    "jml_hepatitis_c": hc,
+                    "jml_hiv": hiv,
+                    "penyakit_menular_lainnya": lain,
+                }, korg)
+
+                results.append({"Baris Excel": i+2, "Status": "OK", "Keterangan": f"Simpan → {korg} / {kasus or '(tanpa kasus)'}"})
+                n_ok += 1
+            except Exception as e:
+                results.append({"Baris Excel": i+2, "Status": "GAGAL", "Keterangan": str(e)})
+        return pd.DataFrame(results), n_ok, n_skip
+
     if up is not None:
         try:
-            df_up = pd.read_excel(up)
-            st.dataframe(df_up.head(20), use_container_width=True)
+            raw = pd.read_excel(up)
+            raw.columns = [str(c).strip() for c in raw.columns]
+            st.dataframe(raw.head(20), use_container_width=True)
 
-            norm_map = {c: c.strip().lower().replace(" ", "_") for c in df_up.columns}
-            df_norm = df_up.rename(columns=norm_map)
+            # Normalisasi header → snake_case minimal
+            norm_map = {c: c.strip().lower().replace(" ", "_") for c in raw.columns}
+            df_norm = raw.rename(columns=norm_map)
 
             required = ["kasus", "jml_hepatitis_c", "jml_hiv", "penyakit_menular_lainnya", "kode_organisasi"]
             missing = [c for c in required if c not in df_norm.columns]
             if missing:
                 st.error(f"Kolom wajib belum lengkap di file: {missing}")
             else:
-                n_ok, n_skip = 0, 0
-                for _, r in df_norm.iterrows():
-                    kasus = str(r.get("kasus") or "").strip()
-                    hc = safe_int(r.get("jml_hepatitis_c", 0))
-                    hiv = safe_int(r.get("jml_hiv", 0))
-                    lain = str(r.get("penyakit_menular_lainnya") or "").strip()
-                    korg = str(r.get("kode_organisasi") or "").strip()
+                log_df, n_ok, n_skip = process_upload(df_norm)
+                st.write("**Hasil unggah:**")
+                st.dataframe(log_df, use_container_width=True)
 
-                    if not korg:
-                        n_skip += 1
-                        continue
-                    if not kasus and hc == 0 and hiv == 0 and not lain:
-                        n_skip += 1
-                        continue
+                ok = (log_df["Status"] == "OK").sum()
+                fail = (log_df["Status"] == "GAGAL").sum()
+                skip = (log_df["Status"] == "LEWAT").sum()
+                if ok: st.success(f"Berhasil menyimpan {ok} baris.")
+                if fail: st.error(f"Gagal menyimpan {fail} baris.")
+                if skip: st.info(f"Dilewati {skip} baris.")
 
-                    payload = {
-                        "kasus": kasus,
-                        "jml_hepatitis_c": hc,
-                        "jml_hiv": hiv,
-                        "penyakit_menular_lainnya": lain,
-                    }
-                    insert_row(TABLE, payload, korg)
-                    n_ok += 1
-
-                if n_ok:
-                    st.success(f"Impor selesai: {n_ok} baris masuk, {n_skip} dilewati.")
-                else:
-                    st.info("Tidak ada baris valid yang diimpor.")
+                # Unduh log
+                log_buf = io.BytesIO()
+                with pd.ExcelWriter(log_buf, engine="xlsxwriter") as w:
+                    log_df.to_excel(w, index=False, sheet_name="Hasil")
+                st.download_button(
+                    "📄 Unduh Log Hasil",
+                    log_buf.getvalue(),
+                    file_name="log_hasil_unggah_infeksi_transfusi_darah.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="itd::dl_log"
+                )
         except Exception as e:
             st.error(f"Gagal memproses file: {e}")
 
     # ====== Tampilkan data ======
-    df = read_with_label(TABLE, limit=1000)
+    try:
+        df = read_with_label_pg(limit=1000)
+    except Exception as e:
+        st.error(f"Gagal membaca data dari Supabase: {e}")
+        df = pd.DataFrame()
+
     if df.empty:
         st.info("Belum ada data tersimpan.")
     else:
@@ -361,6 +283,11 @@ with tab_data:
             "jml_hiv": "Jumlah HIV",
             "penyakit_menular_lainnya": "Penyakit menular lainnya",
         })
+
+        # Hindari masalah tz saat ekspor → stringify waktu
+        if "Created At" in view.columns:
+            view["Created At"] = view["Created At"].astype(str)
+
         st.dataframe(view, use_container_width=True)
 
         buf = io.BytesIO()
