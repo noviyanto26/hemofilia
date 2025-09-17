@@ -319,7 +319,7 @@ with tab_data:
                 log_df, _ = process_upload(df_up)
             
             st.write("**Hasil unggah:**"); st.dataframe(log_df, use_container_width=True)
-            ok, fail, skip = (log_df["Status"] == s).sum() for s in ["OK", "GAGAL", "LEWAT"]
+            ok, fail, skip = [(log_df["Status"] == s).sum() for s in ["OK", "GAGAL", "LEWAT"]]
             if ok: st.success(f"Berhasil menyimpan {ok} baris.")
             if fail: st.error(f"Gagal menyimpan {fail} baris.")
             if skip: st.info(f"Dilewati {skip} baris kosong.")
