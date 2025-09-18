@@ -7,6 +7,10 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
+# 👉 Tambahan impor agar bisa insert ke Postgres (tanpa mengubah bagian lain)
+from sqlalchemy import text
+from db import exec_sql  # gunakan modul koneksi Postgres yang sudah ada di proyek
+
 # =========================
 # Konfigurasi & Konstanta
 # =========================
@@ -47,7 +51,7 @@ ALIAS_TO_DB = {
 }
 
 # =========================
-# Utilitas Database
+# Utilitas Database (SQLite untuk bagian lama — tidak diubah)
 # =========================
 def connect():
     conn = sqlite3.connect(DB_PATH)
@@ -65,7 +69,7 @@ def _table_exists(conn, table):
     return cur.fetchone() is not None
 
 # =========================
-# Migrasi Skema: selaraskan kolom
+# Migrasi Skema: selaraskan kolom (tidak diubah)
 # =========================
 def migrate_if_needed():
     """Pastikan skema final tersedia (kode_organisasi, label, angka-angka, total, is_total_row)."""
@@ -134,7 +138,7 @@ def init_db():
         conn.commit()
 
 # =========================
-# Helper CRUD & Loader
+# Helper CRUD & Loader (bagian lama — tidak diubah)
 # =========================
 def load_hmhi_to_kode():
     """
@@ -228,7 +232,7 @@ with tab_input:
             key="thjk::hmhi_select"
         )
 
-    # ---------- Tabel 1: Penyandang Laki-laki ----------
+    # ---------- Tabel 1: Penyandang Laki-laki (tidak diubah) ----------
     st.subheader("👨 Penyandang Laki-laki")
     df_lk = pd.DataFrame(
         0,
@@ -281,56 +285,73 @@ with tab_input:
 
     st.divider()
 
-    # ---------- Tabel 2: Penyandang Perempuan ----------
+    # ---------- Tabel 2: Penyandang Perempuan (🆕 dimodifikasi sesuai permintaan) ----------
     st.subheader("👩 Penyandang Perempuan")
-    df_pr = pd.DataFrame(
-        0,
-        index=["Hemofilia A perempuan", "Hemofilia B perempuan", "Total Perempuan"],
-        columns=[c for c, _ in SEVERITY_COLS] + [TOTAL_COL]
-    )
-    df_pr.index.name = "Baris"
 
-    with st.form("thjk::form_pr"):
-        ed_pr = st.data_editor(
-            df_pr,
-            key="thjk::editor_pr",
-            column_config=col_cfg,
+    # Tabel input baru: hanya 2 baris + 4 kolom (Carrier, Ringan, Sedang, Berat)
+    FEMALE_ROWS = ["Hemofilia A perempuan", "Hemofilia B perempuan"]
+    FEMALE_COLS = [
+        ("carrier", "Carrier (>40%)"),
+        ("ringan", "Ringan (>5%)"),
+        ("sedang", "Sedang (1-5%)"),
+        ("berat",  "Berat (<1%)"),
+    ]
+    df_pr_new = pd.DataFrame(0, index=FEMALE_ROWS, columns=[c for c, _ in FEMALE_COLS])
+    df_pr_new.index.name = "Jenis Hemofilia"
+    col_cfg_pr = {c: st.column_config.NumberColumn(lbl, min_value=0, step=1) for c, lbl in FEMALE_COLS}
+
+    with st.form("thjk::form_pr_new"):
+        ed_pr_new = st.data_editor(
+            df_pr_new,
+            key="thjk::editor_pr_new",
+            column_config=col_cfg_pr,
             use_container_width=True,
             num_rows="fixed",
         )
-        # Total per baris (HA pr & HB pr)
-        for row_label in ["Hemofilia A perempuan", "Hemofilia B perempuan"]:
-            ed_pr.loc[row_label, TOTAL_COL] = sum(_to_nonneg_int(ed_pr.loc[row_label, c]) for c, _ in SEVERITY_COLS)
-        # Baris Total Perempuan = penjumlahan 2 baris di atas per kolom
-        for c, _ in SEVERITY_COLS:
-            ed_pr.loc["Total Perempuan", c] = _to_nonneg_int(ed_pr.loc["Hemofilia A perempuan", c]) + _to_nonneg_int(ed_pr.loc["Hemofilia B perempuan", c])
-        ed_pr.loc["Total Perempuan", TOTAL_COL] = sum(_to_nonneg_int(ed_pr.loc["Total Perempuan", c]) for c, _ in SEVERITY_COLS)
+        submit_pr_new = st.form_submit_button("💾 Simpan Data Perempuan (ke Postgres)")
 
-        submit_pr = st.form_submit_button("💾 Simpan Data Perempuan")
-
-    if submit_pr:
+    if submit_pr_new:
         if not selected_hmhi:
             st.error("Pilih HMHI cabang terlebih dahulu.")
         else:
-            kode_organisasi = hmhi_map.get(selected_hmhi)
-            if not kode_organisasi:
-                st.error("Kode organisasi tidak ditemukan untuk HMHI cabang terpilih.")
-            else:
-                for label in ed_pr.index.tolist():
-                    payload = {
-                        "label": label,
-                        "ringan": _to_nonneg_int(ed_pr.loc[label, "ringan"]),
-                        "sedang": _to_nonneg_int(ed_pr.loc[label, "sedang"]),
-                        "berat": _to_nonneg_int(ed_pr.loc[label, "berat"]),
-                        "tidak_diketahui": _to_nonneg_int(ed_pr.loc[label, "tidak_diketahui"]),
-                        "total": _to_nonneg_int(ed_pr.loc[label, "total"]),
-                        "is_total_row": "1" if label.startswith("Total ") else "0",
-                    }
-                    insert_row(payload, kode_organisasi)
-                st.success(f"Data perempuan tersimpan untuk **{selected_hmhi}**.")
+            # Insert ke Postgres: public.hemofilia_perempuan
+            # Skema:
+            #   id SERIAL PK
+            #   jenis_hemofilia TEXT NOT NULL
+            #   carrier INTEGER DEFAULT 0
+            #   ringan  INTEGER DEFAULT 0
+            #   sedang  INTEGER DEFAULT 0
+            #   berat   INTEGER DEFAULT 0
+            #   created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT now()
+            try:
+                for jh in ed_pr_new.index.tolist():
+                    carrier = _to_nonneg_int(ed_pr_new.loc[jh, "carrier"])
+                    ringan  = _to_nonneg_int(ed_pr_new.loc[jh, "ringan"])
+                    sedang  = _to_nonneg_int(ed_pr_new.loc[jh, "sedang"])
+                    berat   = _to_nonneg_int(ed_pr_new.loc[jh, "berat"])
+
+                    # gunakan exec_sql dari modul db (Postgres)
+                    exec_sql(
+                        text("""
+                            INSERT INTO public.hemofilia_perempuan
+                                (jenis_hemofilia, carrier, ringan, sedang, berat)
+                            VALUES
+                                (:jenis_hemofilia, :carrier, :ringan, :sedang, :berat)
+                        """),
+                        {
+                            "jenis_hemofilia": jh,
+                            "carrier": carrier,
+                            "ringan": ringan,
+                            "sedang": sedang,
+                            "berat": berat,
+                        }
+                    )
+                st.success("Data perempuan berhasil disimpan ke Postgres (public.hemofilia_perempuan).")
+            except Exception as e:
+                st.error(f"Gagal menyimpan data perempuan ke Postgres: {e}")
 
 # =========================
-# Data Tersimpan & Unggah Excel
+# Data Tersimpan & Unggah Excel (tidak diubah)
 # =========================
 with tab_data:
     st.subheader("📄 Data Tersimpan")
