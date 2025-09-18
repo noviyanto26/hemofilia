@@ -1,15 +1,12 @@
-import os
 import io
-import sqlite3
 from datetime import datetime
-from pathlib import Path
 
 import pandas as pd
 import streamlit as st
-
-# 👉 Tambahan impor Postgres
 from sqlalchemy import text
-from db import exec_sql, read_sql_df  # <— read_sql_df dipakai untuk SELECT ke Postgres
+
+# 👉 modul koneksi Postgres milik proyek Anda
+from db import exec_sql, read_sql_df
 
 # =========================
 # Konfigurasi & Konstanta
@@ -17,10 +14,7 @@ from db import exec_sql, read_sql_df  # <— read_sql_df dipakai untuk SELECT ke
 st.set_page_config(page_title="Tingkat Hemofilia & Jenis Kelamin", page_icon="🩸", layout="wide")
 st.title("🩸 Tingkat Hemofilia dan Jenis Kelamin")
 
-BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = str((BASE_DIR / "hemofilia.db").resolve())
-
-TABLE = "tingkat_hemofilia_jenis_kelamin"
+TABLE = "public.tingkat_hemofilia_jenis_kelamin"
 
 SEVERITY_COLS = [
     ("ringan", "Ringan (>5%)"),
@@ -69,112 +63,24 @@ FEMALE_ALIAS = {
 }
 
 # =========================
-# Utilitas Database (SQLite untuk bagian lama — tidak diubah)
-# =========================
-def connect():
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("PRAGMA foreign_keys=ON")
-    return conn
-
-def _has_column(conn, table, col):
-    cur = conn.cursor()
-    cur.execute(f"PRAGMA table_info({table})")
-    return any((row[1] == col) for row in cur.fetchall())
-
-def _table_exists(conn, table):
-    cur = conn.cursor()
-    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,))
-    return cur.fetchone() is not None
-
-# =========================
-# Migrasi Skema (tetap)
-# =========================
-def migrate_if_needed():
-    with connect() as conn:
-        if not _table_exists(conn, TABLE):
-            return
-        needed = ["kode_organisasi", "label", "ringan", "sedang", "berat", "tidak_diketahui", "total", "is_total_row", "created_at"]
-        cur = conn.cursor()
-        cur.execute(f"PRAGMA table_info({TABLE})")
-        have = [r[1] for r in cur.fetchall()]
-        if all(col in have for col in needed):
-            return
-
-        st.warning("Migrasi skema: menyesuaikan tabel Tingkat Hemofilia & Jenis Kelamin…")
-        cur.execute("PRAGMA foreign_keys=OFF")
-        try:
-            cur.execute(f"""
-                CREATE TABLE IF NOT EXISTS {TABLE}_new (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    kode_organisasi TEXT,
-                    created_at TEXT NOT NULL,
-                    label TEXT,
-                    ringan INTEGER,
-                    sedang INTEGER,
-                    berat INTEGER,
-                    tidak_diketahui INTEGER,
-                    total INTEGER,
-                    is_total_row TEXT,
-                    FOREIGN KEY (kode_organisasi) REFERENCES identitas_organisasi(kode_organisasi)
-                )
-            """)
-            cur.execute(f"PRAGMA table_info({TABLE})")
-            old_cols = [r[1] for r in cur.fetchall() if r[1] != "id"]
-            if old_cols:
-                cols_csv = ", ".join(old_cols)
-                cur.execute(f"INSERT INTO {TABLE}_new ({cols_csv}) SELECT {cols_csv} FROM {TABLE}")
-            cur.execute(f"ALTER TABLE {TABLE} RENAME TO {TABLE}_backup")
-            cur.execute(f"ALTER TABLE {TABLE}_new RENAME TO {TABLE}")
-            conn.commit()
-            st.success("Migrasi selesai. Tabel lama disimpan sebagai _backup.")
-        except Exception as e:
-            conn.rollback()
-            st.error(f"Migrasi gagal: {e}")
-        finally:
-            cur.execute("PRAGMA foreign_keys=ON")
-
-def init_db():
-    with connect() as conn:
-        c = conn.cursor()
-        c.execute(f"""
-            CREATE TABLE IF NOT EXISTS {TABLE} (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                kode_organisasi TEXT,
-                created_at TEXT NOT NULL,
-                label TEXT,
-                ringan INTEGER,
-                sedang INTEGER,
-                berat INTEGER,
-                tidak_diketahui INTEGER,
-                total INTEGER,
-                is_total_row TEXT,
-                FOREIGN KEY (kode_organisasi) REFERENCES identitas_organisasi(kode_organisasi)
-            )
-        """)
-        conn.commit()
-
-# =========================
-# Helper CRUD & Loader (lama)
+# Utilitas Postgres
 # =========================
 def load_hmhi_to_kode():
-    with connect() as conn:
-        try:
-            df = pd.read_sql_query(
-                "SELECT kode_organisasi, hmhi_cabang FROM identitas_organisasi ORDER BY id DESC",
-                conn
-            )
-            if df.empty:
-                return {}, []
-            mapping = {}
-            for _, row in df.iterrows():
-                hmhi_val = str(row["hmhi_cabang"]).strip() if pd.notna(row["hmhi_cabang"]) else ""
-                kode_val = str(row["kode_organisasi"]).strip() if pd.notna(row["kode_organisasi"]) else ""
-                if hmhi_val:
-                    mapping[hmhi_val] = kode_val
-            options = sorted(mapping.keys())
-            return mapping, options
-        except Exception:
-            return {}, []
+    """
+    Baca public.identitas_organisasi → mapping hmhi_cabang -> kode_organisasi
+    """
+    df = read_sql_df("""
+        SELECT kode_organisasi, hmhi_cabang
+        FROM public.identitas_organisasi
+        WHERE COALESCE(TRIM(hmhi_cabang),'') <> ''
+        ORDER BY hmhi_cabang ASC
+    """)
+    if df is None or df.empty:
+        return {}, []
+    mapping = {str(r.hmhi_cabang).strip(): str(r.kode_organisasi).strip() for _, r in df.iterrows()}
+    options = sorted(mapping.keys())
+    return mapping, options
+
 
 def _to_nonneg_int(v):
     try:
@@ -185,43 +91,49 @@ def _to_nonneg_int(v):
     except Exception:
         return 0
 
+
 def insert_row(payload: dict, kode_organisasi: str):
-    with connect() as conn:
-        c = conn.cursor()
-        cols = ", ".join(payload.keys())
-        placeholders = ", ".join(["?"] * len(payload))
-        vals = [payload[k] for k in payload]
-        c.execute(
-            f"INSERT INTO {TABLE} (kode_organisasi, created_at, {cols}) VALUES (?, ?, {placeholders})",
-            [kode_organisasi, datetime.utcnow().isoformat()] + vals
-        )
-        conn.commit()
+    """
+    Insert ke public.tingkat_hemofilia_jenis_kelamin (created_at DEFAULT now() di DB).
+    Kolom: kode_organisasi, label, ringan, sedang, berat, tidak_diketahui, total, is_total_row
+    """
+    exec_sql(
+        text(f"""
+            INSERT INTO {TABLE}
+                (kode_organisasi, label, ringan, sedang, berat, tidak_diketahui, total, is_total_row)
+            VALUES
+                (:kode_organisasi, :label, :ringan, :sedang, :berat, :td, :total, :is_total_row)
+        """),
+        {
+            "kode_organisasi": kode_organisasi,
+            "label": payload.get("label"),
+            "ringan": payload.get("ringan", 0),
+            "sedang": payload.get("sedang", 0),
+            "berat": payload.get("berat", 0),
+            "td": payload.get("tidak_diketahui", 0),
+            "total": payload.get("total", 0),
+            "is_total_row": payload.get("is_total_row", "0"),
+        }
+    )
+
 
 def read_with_join(limit=500):
-    with connect() as conn:
-        if not _has_column(conn, TABLE, "kode_organisasi"):
-            st.error("Kolom 'kode_organisasi' belum tersedia. Coba refresh setelah migrasi.")
-            return pd.read_sql_query(f"SELECT * FROM {TABLE} ORDER BY id DESC LIMIT ?", conn, params=[limit])
+    """
+    Baca data laki-laki (tabel tingkat_hemofilia_jenis_kelamin) + join identitas_organisasi
+    """
+    sql = f"""
+        SELECT
+            t.id, t.kode_organisasi, t.created_at, t.label,
+            t.ringan, t.sedang, t.berat, t.tidak_diketahui, t.total, t.is_total_row,
+            io.kota_cakupan_cabang, io.hmhi_cabang
+        FROM {TABLE} t
+        LEFT JOIN public.identitas_organisasi io ON io.kode_organisasi = t.kode_organisasi
+        ORDER BY t.id DESC
+        LIMIT :lim
+    """
+    df = read_sql_df(sql, params={"lim": int(limit)})
+    return df if df is not None else pd.DataFrame()
 
-        return pd.read_sql_query(
-            f"""
-            SELECT
-              t.id, t.kode_organisasi, t.created_at, t.label,
-              t.ringan, t.sedang, t.berat, t.tidak_diketahui, t.total, t.is_total_row,
-              io.kota_cakupan_cabang, io.hmhi_cabang
-            FROM {TABLE} t
-            LEFT JOIN identitas_organisasi io ON io.kode_organisasi = t.kode_organisasi
-            ORDER BY t.id DESC
-            LIMIT ?
-            """,
-            conn, params=[limit]
-        )
-
-# =========================
-# Startup
-# =========================
-migrate_if_needed()
-init_db()
 
 # =========================
 # Antarmuka
@@ -261,8 +173,10 @@ with tab_input:
             use_container_width=True,
             num_rows="fixed",
         )
+        # Total per baris (HA lk & HB lk)
         for row_label in ["Hemofilia A laki-laki", "Hemofilia B laki-laki"]:
             ed_lk.loc[row_label, TOTAL_COL] = sum(_to_nonneg_int(ed_lk.loc[row_label, c]) for c, _ in SEVERITY_COLS)
+        # Baris Total Laki-laki = penjumlahan 2 baris di atas per kolom
         for c, _ in SEVERITY_COLS:
             ed_lk.loc["Total Laki-laki", c] = _to_nonneg_int(ed_lk.loc["Hemofilia A laki-laki", c]) + _to_nonneg_int(ed_lk.loc["Hemofilia B laki-laki", c])
         ed_lk.loc["Total Laki-laki", TOTAL_COL] = sum(_to_nonneg_int(ed_lk.loc["Total Laki-laki", c]) for c, _ in SEVERITY_COLS)
@@ -326,6 +240,7 @@ with tab_input:
                     ringan  = _to_nonneg_int(ed_pr_new.loc[jh, "ringan"])
                     sedang  = _to_nonneg_int(ed_pr_new.loc[jh, "sedang"])
                     berat   = _to_nonneg_int(ed_pr_new.loc[jh, "berat"])
+                    # Simpan ke Postgres
                     exec_sql(
                         text("""
                             INSERT INTO public.hemofilia_perempuan
@@ -349,12 +264,12 @@ with tab_input:
 # Data Tersimpan & Unggah Excel
 # =========================
 with tab_data:
-    st.subheader("📄 Data Tersimpan")
-
-    # ----- 1) Data Tingkat Hemofilia & JK (SQLite) -----
+    st.subheader("📄 Data Tersimpan (Laki-laki)")
     df = read_with_join(limit=500)
 
     st.caption("Gunakan template berikut saat mengunggah data (kolom harus sesuai).")
+
+    # (1) Template lama — Tingkat Hemofilia & JK
     template_rows = [
         {"HMHI cabang": "", "Baris": "Hemofilia A laki-laki", "Ringan (>5%)": 0, "Sedang (1-5%)": 0, "Berat (<1%)": 0, "Tidak diketahui": 0, "Total": 0},
         {"HMHI cabang": "", "Baris": "Hemofilia B laki-laki", "Ringan (>5%)": 0, "Sedang (1-5%)": 0, "Berat (<1%)": 0, "Tidak diketahui": 0, "Total": 0},
@@ -375,9 +290,9 @@ with tab_data:
         key="thjk::dl_template"
     )
 
-    # Tabel tampil (JK)
+    # ====== Tabel tampilan (Laki-laki) ======
     if df.empty:
-        st.info("Belum ada data JK.")
+        st.info("Belum ada data laki-laki.")
     else:
         order = ["hmhi_cabang", "kota_cakupan_cabang", "created_at", "label",
                  "ringan", "sedang", "berat", "tidak_diketahui", "total"]
@@ -399,7 +314,7 @@ with tab_data:
         with pd.ExcelWriter(buffer, engine="xlsxwriter") as w:
             view.to_excel(w, index=False, sheet_name="TingkatHemofiliaJK")
         st.download_button(
-            "⬇️ Unduh Excel (Data Tersimpan JK)",
+            "⬇️ Unduh Excel (Data Tersimpan Laki-laki)",
             buffer.getvalue(),
             file_name="tingkat_hemofilia_jenis_kelamin.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -408,35 +323,65 @@ with tab_data:
 
     st.divider()
 
-    # ----- 2) 🆕 Data Penyandang Perempuan (Postgres) -----
-    st.subheader("👩 Data Tersimpan — Penyandang Perempuan (Postgres)")
+    # (2) Template khusus Penyandang Perempuan — ada kolom HMHI Cabang + sheet referensi
+    st.subheader("📄 Data Tersimpan (Perempuan)")
+    st.caption("Atau gunakan template khusus untuk input Penyandang Perempuan (Postgres: public.hemofilia_perempuan).")
+    female_template_rows = [
+        {
+            "HMHI Cabang": "",
+            "Jenis Hemofilia": "Hemofilia A perempuan",
+            "Carrier (>40%)": 0, "Ringan (>5%)": 0, "Sedang (1-5%)": 0, "Berat (<1%)": 0
+        },
+        {
+            "HMHI Cabang": "",
+            "Jenis Hemofilia": "Hemofilia B perempuan",
+            "Carrier (>40%)": 0, "Ringan (>5%)": 0, "Sedang (1-5%)": 0, "Berat (<1%)": 0
+        },
+    ]
+    female_tmpl_df = pd.DataFrame(female_template_rows, columns=FEMALE_TEMPLATE_COLUMNS)
 
-    # Query dengan string biasa (bukan TextClause) agar cocok dengan read_sql_df
+    hmhi_map_ref, _ = load_hmhi_to_kode()
+    ref_rows = [{"HMHI Cabang": k, "kode_organisasi": v} for k, v in hmhi_map_ref.items()]
+    ref_df = pd.DataFrame(ref_rows, columns=["HMHI Cabang", "kode_organisasi"])
+
+    buf_tmpl_f = io.BytesIO()
+    with pd.ExcelWriter(buf_tmpl_f, engine="xlsxwriter") as w:
+        female_tmpl_df.to_excel(w, index=False, sheet_name="PenyandangPerempuan")
+        (ref_df if not ref_df.empty else pd.DataFrame(columns=["HMHI Cabang", "kode_organisasi"])) \
+            .to_excel(w, index=False, sheet_name="ReferensiHMHI")
+    st.download_button(
+        "📥 Unduh Template Excel (Penyandang Perempuan)",
+        buf_tmpl_f.getvalue(),
+        file_name="template_penyandang_perempuan.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="thjk::dl_template_female"
+    )
+
+    # ====== Query Data Perempuan dari Postgres ======
     sql_female = """
-        SELECT
-          hp.id,
-          hp.created_at,
-          hp.kode_organisasi,
-          io.hmhi_cabang,
-          io.kota_cakupan_cabang,
-          hp.jenis_hemofilia,
-          hp.carrier,
-          hp.ringan,
-          hp.sedang,
-          hp.berat
+        SELECT 
+            hp.id, hp.kode_organisasi, hp.jenis_hemofilia,
+            hp.carrier, hp.ringan, hp.sedang, hp.berat,
+            hp.created_at,
+            io.hmhi_cabang, io.kota_cakupan_cabang
         FROM public.hemofilia_perempuan hp
-        LEFT JOIN public.identitas_organisasi io
+        LEFT JOIN public.identitas_organisasi io 
           ON io.kode_organisasi = hp.kode_organisasi
         ORDER BY hp.id DESC
         LIMIT :lim
     """
-    df_female = read_sql_df(sql_female, params={"lim": 500}) or pd.DataFrame()
+    df_female = read_sql_df(sql_female, params={"lim": 500})
+    if df_female is None or df_female.empty:
+        df_female = pd.DataFrame()
 
+    # ====== Tabel tampilan (Perempuan) ======
     if df_female.empty:
-        st.info("Belum ada data Penyandang Perempuan.")
+        st.info("Belum ada data penyandang perempuan.")
     else:
-        order_f = ["hmhi_cabang", "kota_cakupan_cabang", "created_at",
-                   "jenis_hemofilia", "carrier", "ringan", "sedang", "berat"]
+        order_f = [
+            "hmhi_cabang", "kota_cakupan_cabang", "created_at",
+            "jenis_hemofilia", "carrier", "ringan", "sedang", "berat"
+        ]
         order_f = [c for c in order_f if c in df_female.columns]
         view_f = df_female[order_f].rename(columns={
             "hmhi_cabang": "HMHI cabang",
@@ -450,18 +395,19 @@ with tab_data:
         })
         st.dataframe(view_f, use_container_width=True)
 
-        buf_f = io.BytesIO()
-        with pd.ExcelWriter(buf_f, engine="xlsxwriter") as w:
-            view_f.to_excel(w, index=False, sheet_name="PenyandangPerempuan")
+        buf_female = io.BytesIO()
+        with pd.ExcelWriter(buf_female, engine="xlsxwriter") as w:
+            view_f.to_excel(w, index=False, sheet_name="HemofiliaPerempuan")
         st.download_button(
-            "⬇️ Unduh Excel (Penyandang Perempuan)",
-            buf_f.getvalue(),
-            file_name="penyandang_perempuan.xlsx",
+            "⬇️ Unduh Excel (Data Tersimpan Perempuan)",
+            buf_female.getvalue(),
+            file_name="hemofilia_perempuan.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             key="thjk::download_female"
         )
 
-    # ====== Unggah Excel ======
+    # ====== Unggah Excel (dua jenis template) ======
+    st.divider()
     st.markdown("### ⬆️ Unggah Excel")
     st.caption("Anda bisa mengunggah salah satu: (1) Template Tingkat Hemofilia & JK, atau (2) Template Penyandang Perempuan.")
     up = st.file_uploader(
@@ -479,6 +425,7 @@ with tab_data:
             st.stop()
 
         cols = set(raw.columns)
+
         is_general = set(TEMPLATE_COLUMNS).issubset(cols)
         is_female  = set(FEMALE_TEMPLATE_COLUMNS).issubset(cols)
 
@@ -494,15 +441,17 @@ with tab_data:
         # ===== Jalur 1: Template Umum =====
         if is_general:
             df_up = raw.rename(columns=ALIAS_TO_DB).copy()
+
             st.caption("Pratinjau 20 baris pertama dari file yang diunggah:")
             st.dataframe(raw.head(20), use_container_width=True)
 
             if st.button("🚀 Proses & Simpan (Template Umum)", type="primary", key="thjk::process_general"):
                 hmhi_map, _ = load_hmhi_to_kode()
                 results = []
+
                 for i in range(len(df_up)):
                     try:
-                        s = df_up.iloc[i]
+                        s = df_up.iloc[i]  # pandas.Series
                         hmhi = str((s.get("hmhi_cabang_info") or "")).strip()
                         if not hmhi:
                             raise ValueError("Kolom 'HMHI cabang' kosong.")
@@ -561,12 +510,14 @@ with tab_data:
         # ===== Jalur 2: Template Penyandang Perempuan =====
         if is_female:
             df_fp = raw.rename(columns=FEMALE_ALIAS).copy()
+
             st.caption("Pratinjau 20 baris pertama dari file yang diunggah (Penyandang Perempuan):")
             st.dataframe(raw.head(20), use_container_width=True)
 
             if st.button("🚀 Proses & Simpan (Penyandang Perempuan)", type="primary", key="thjk::process_female"):
                 hmhi_map, _ = load_hmhi_to_kode()
                 results_f = []
+
                 for i in range(len(df_fp)):
                     try:
                         s = df_fp.iloc[i]
@@ -586,6 +537,7 @@ with tab_data:
                         sedang  = _to_nonneg_int(s.get("sedang"))
                         berat   = _to_nonneg_int(s.get("berat"))
 
+                        # Jika tabel punya kolom kode_organisasi → gunakan; jika belum → fallback.
                         try:
                             exec_sql(
                                 text("""
