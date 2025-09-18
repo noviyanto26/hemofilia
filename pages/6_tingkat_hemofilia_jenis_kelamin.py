@@ -351,13 +351,13 @@ with tab_input:
                 st.error(f"Gagal menyimpan data perempuan ke Postgres: {e}")
 
 # =========================
-# Data Tersimpan & Unggah Excel (tidak diubah)
+# Data Tersimpan & Unggah Excel (tidak diubah kecuali template perempuan)
 # =========================
 with tab_data:
     st.subheader("📄 Data Tersimpan")
     df = read_with_join(limit=500)
 
-        # ====== Unduh Template Excel ======
+    # ====== Unduh Template Excel ======
     st.caption("Gunakan template berikut saat mengunggah data (kolom harus sesuai).")
 
     # (1) Template lama — untuk upload 'tingkat_hemofilia_jenis_kelamin' (tetap)
@@ -381,9 +381,10 @@ with tab_data:
         key="thjk::dl_template"
     )
 
-    # (2) 🆕 Template khusus Penyandang Perempuan — untuk table public.hemofilia_perempuan
+    # (2) 🆕 Template khusus Penyandang Perempuan — tambahkan kolom HMHI Cabang + sheet referensi
     st.caption("Atau gunakan template khusus untuk input Penyandang Perempuan (Postgres: public.hemofilia_perempuan).")
     FEMALE_TEMPLATE_COLUMNS = [
+        "HMHI Cabang",           # 🆕 untuk relasi ke identitas_organisasi via kode_organisasi
         "Jenis Hemofilia",
         "Carrier (>40%)",
         "Ringan (>5%)",
@@ -391,13 +392,29 @@ with tab_data:
         "Berat (<1%)",
     ]
     female_template_rows = [
-        {"Jenis Hemofilia": "Hemofilia A perempuan", "Carrier (>40%)": 0, "Ringan (>5%)": 0, "Sedang (1-5%)": 0, "Berat (<1%)": 0},
-        {"Jenis Hemofilia": "Hemofilia B perempuan", "Carrier (>40%)": 0, "Ringan (>5%)": 0, "Sedang (1-5%)": 0, "Berat (<1%)": 0},
+        {
+            "HMHI Cabang": "",
+            "Jenis Hemofilia": "Hemofilia A perempuan",
+            "Carrier (>40%)": 0, "Ringan (>5%)": 0, "Sedang (1-5%)": 0, "Berat (<1%)": 0
+        },
+        {
+            "HMHI Cabang": "",
+            "Jenis Hemofilia": "Hemofilia B perempuan",
+            "Carrier (>40%)": 0, "Ringan (>5%)": 0, "Sedang (1-5%)": 0, "Berat (<1%)": 0
+        },
     ]
     female_tmpl_df = pd.DataFrame(female_template_rows, columns=FEMALE_TEMPLATE_COLUMNS)
+
+    # Sheet referensi HMHI ↔ kode_organisasi dari tabel identitas_organisasi
+    hmhi_map_ref, _ = load_hmhi_to_kode()
+    ref_rows = [{"HMHI Cabang": k, "kode_organisasi": v} for k, v in hmhi_map_ref.items()]
+    ref_df = pd.DataFrame(ref_rows, columns=["HMHI Cabang", "kode_organisasi"])
+
     buf_tmpl_f = io.BytesIO()
     with pd.ExcelWriter(buf_tmpl_f, engine="xlsxwriter") as w:
         female_tmpl_df.to_excel(w, index=False, sheet_name="PenyandangPerempuan")
+        (ref_df if not ref_df.empty else pd.DataFrame(columns=["HMHI Cabang", "kode_organisasi"])) \
+            .to_excel(w, index=False, sheet_name="ReferensiHMHI")
     st.download_button(
         "📥 Unduh Template Excel (Penyandang Perempuan)",
         buf_tmpl_f.getvalue(),
