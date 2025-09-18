@@ -108,7 +108,7 @@ def read_with_join(limit=500):
 init_db()
 
 # ======================== UI ========================
-tab_input, tab_data = st.tabs(["📝 Input (Editor Tabel)", "📄 Data"])
+tab_input, tab_data = st.tabs(["📝 Input", "📄 Data"])
 
 with tab_input:
     st.caption("Isi total pasien nonfaktor untuk satu HMHI cabang. Kolom **Total** dihitung otomatis.")
