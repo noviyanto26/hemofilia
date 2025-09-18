@@ -7,8 +7,7 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-# 👉 Tambahan impor agar bisa insert ke Postgres (tanpa mengubah bagian lain)
-from sqlalchemy import text
+# 👉 exec_sql sudah tersedia untuk Postgres
 from db import exec_sql  # gunakan modul koneksi Postgres yang sudah ada di proyek
 
 # =========================
@@ -131,12 +130,13 @@ def migrate_if_needed():
             st.success("Migrasi selesai. Tabel lama disimpan sebagai _backup.")
         except Exception as e:
             conn.rollback()
-            st.error(f"Migrasi gagal: {e}")
+            st.error(f"Migrisi gagal: {e}")
         finally:
             cur.execute("PRAGMA foreign_keys=ON")
 
 def init_db():
     with connect() as conn:
+        c = conn.cursor
         c = conn.cursor()
         c.execute(f"""
             CREATE TABLE IF NOT EXISTS {TABLE} (
@@ -337,14 +337,14 @@ with tab_input:
                     ringan  = _to_nonneg_int(ed_pr_new.loc[jh, "ringan"])
                     sedang  = _to_nonneg_int(ed_pr_new.loc[jh, "sedang"])
                     berat   = _to_nonneg_int(ed_pr_new.loc[jh, "berat"])
-                    # Simpan ke Postgres
+                    # Simpan ke Postgres (pakai STRING SQL, bukan TextClause)
                     exec_sql(
-                        text("""
-                            INSERT INTO public.hemofilia_perempuan
-                                (jenis_hemofilia, carrier, ringan, sedang, berat)
-                            VALUES
-                                (:jenis_hemofilia, :carrier, :ringan, :sedang, :berat)
-                        """),
+                        """
+                        INSERT INTO public.hemofilia_perempuan
+                            (jenis_hemofilia, carrier, ringan, sedang, berat)
+                        VALUES
+                            (:jenis_hemofilia, :carrier, :ringan, :sedang, :berat)
+                        """,
                         {
                             "jenis_hemofilia": jh,
                             "carrier": carrier,
@@ -582,15 +582,15 @@ with tab_data:
                         sedang  = _to_nonneg_int(s.get("sedang"))
                         berat   = _to_nonneg_int(s.get("berat"))
 
-                        # Jika tabel sudah ditambah kolom kode_organisasi, pakai kolom itu.
+                        # Simpan ke Postgres (pakai STRING SQL, bukan TextClause)
                         try:
                             exec_sql(
-                                text("""
-                                    INSERT INTO public.hemofilia_perempuan
-                                        (kode_organisasi, jenis_hemofilia, carrier, ringan, sedang, berat)
-                                    VALUES
-                                        (:kode_organisasi, :jenis_hemofilia, :carrier, :ringan, :sedang, :berat)
-                                """),
+                                """
+                                INSERT INTO public.hemofilia_perempuan
+                                    (kode_organisasi, jenis_hemofilia, carrier, ringan, sedang, berat)
+                                VALUES
+                                    (:kode_organisasi, :jenis_hemofilia, :carrier, :ringan, :sedang, :berat)
+                                """,
                                 {
                                     "kode_organisasi": kode_organisasi,
                                     "jenis_hemofilia": jenis,
@@ -603,12 +603,12 @@ with tab_data:
                         except Exception:
                             # fallback jika kolom kode_organisasi belum ada
                             exec_sql(
-                                text("""
-                                    INSERT INTO public.hemofilia_perempuan
-                                        (jenis_hemofilia, carrier, ringan, sedang, berat)
-                                    VALUES
-                                        (:jenis_hemofilia, :carrier, :ringan, :sedang, :berat)
-                                """),
+                                """
+                                INSERT INTO public.hemofilia_perempuan
+                                    (jenis_hemofilia, carrier, ringan, sedang, berat)
+                                VALUES
+                                    (:jenis_hemofilia, :carrier, :ringan, :sedang, :berat)
+                                """,
                                 {
                                     "jenis_hemofilia": jenis,
                                     "carrier": carrier,
