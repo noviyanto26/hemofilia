@@ -33,6 +33,7 @@ USIA_COLUMNS = [
     ("hemo_tipe_lain", "Hemofilia Tipe Lain"),
     ("vwd_tipe1", "vWD - Tipe 1"),
     ("vwd_tipe2", "vWD - Tipe 2"),
+    ("vwd_tipe3", "vWD - Tipe 3"),  # ✅ kolom baru
 ]
 
 # ========== Template unggah ==========
@@ -314,7 +315,7 @@ with tab_data:
     else:
         order = (
             ["hmhi_cabang", "kelompok_usia"]  # tampilkan HMHI & Kelompok Usia
-            + [n for n, _ in USIA_COLUMNS]    # semua metrik
+            + [n for n, _ in USIA_COLUMNS]    # semua metrik (termasuk vwd_tipe3)
             # sengaja tidak memasukkan: "kota_cakupan_cabang", "created_at"
         )
         order = [c for c in order if c in df_x.columns]
@@ -375,13 +376,11 @@ with tab_data:
             hmhi_map, _ = load_hmhi_to_kode()
             results = []
 
-            # ✅ iterasi berbasis indeks → setiap baris via iloc[i].to_dict() (selalu dict)
+            # ✅ iterasi berbasis indeks → setiap baris via iloc[i].to_dict()
             nrows = len(df_up)
             for i in range(nrows):
                 try:
                     s = df_up.iloc[i]            # pandas.Series
-                    rec = s.to_dict()            # dict untuk kenyamanan (opsional)
-
                     # HMHI (wajib)
                     hmhi = str((s.get("hmhi_cabang_info") or "")).strip()
                     if not hmhi:
