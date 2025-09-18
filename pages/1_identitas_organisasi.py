@@ -214,8 +214,7 @@ def read_data_pg(limit=500):
 tab_input, tab_data = st.tabs(["📝 Input", "📄 Data Tersimpan"])
 
 with tab_input:
-    st.caption("Isi identitas organisasi. Opsi **Provinsi** akan diambil dari tabel Postgres `public.wilayah` (jika tersedia).")
-
+   
     provinsi_options = load_provinsi_options_pg()
 
     with st.form(key="identitas::form", clear_on_submit=True):
