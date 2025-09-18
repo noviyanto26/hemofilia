@@ -7,8 +7,9 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-# 👉 exec_sql sudah tersedia untuk Postgres
-from db import exec_sql  # gunakan modul koneksi Postgres yang sudah ada di proyek
+# 👉 Tambahan impor Postgres
+from sqlalchemy import text
+from db import exec_sql, read_sql_df  # <— read_sql_df dipakai untuk SELECT ke Postgres
 
 # =========================
 # Konfigurasi & Konstanta
@@ -19,7 +20,7 @@ st.title("🩸 Tingkat Hemofilia dan Jenis Kelamin")
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = str((BASE_DIR / "hemofilia.db").resolve())
 
-TABLE = "tingkat_hemofilia_jenis_kelamin"   # ganti jika DB Anda sudah memakai nama lain
+TABLE = "tingkat_hemofilia_jenis_kelamin"
 
 SEVERITY_COLS = [
     ("ringan", "Ringan (>5%)"),
@@ -32,12 +33,12 @@ TOTAL_COL = "total"
 # ===== Template unggah & alias (untuk upload Excel) =====
 TEMPLATE_COLUMNS = [
     "HMHI cabang",
-    "Baris",                     # contoh: Hemofilia A laki-laki, Hemofilia B perempuan, Total Laki-laki, dst.
+    "Baris",
     "Ringan (>5%)",
     "Sedang (1-5%)",
     "Berat (<1%)",
     "Tidak diketahui",
-    "Total",                     # boleh dikosongkan; akan dihitung otomatis jika 0/kosong
+    "Total",
 ]
 ALIAS_TO_DB = {
     "HMHI cabang": "hmhi_cabang_info",
@@ -86,10 +87,9 @@ def _table_exists(conn, table):
     return cur.fetchone() is not None
 
 # =========================
-# Migrasi Skema: selaraskan kolom (tidak diubah)
+# Migrasi Skema (tetap)
 # =========================
 def migrate_if_needed():
-    """Pastikan skema final tersedia (kode_organisasi, label, angka-angka, total, is_total_row)."""
     with connect() as conn:
         if not _table_exists(conn, TABLE):
             return
@@ -118,7 +118,6 @@ def migrate_if_needed():
                     FOREIGN KEY (kode_organisasi) REFERENCES identitas_organisasi(kode_organisasi)
                 )
             """)
-            # copy kolom yang ada saja
             cur.execute(f"PRAGMA table_info({TABLE})")
             old_cols = [r[1] for r in cur.fetchall() if r[1] != "id"]
             if old_cols:
@@ -130,13 +129,12 @@ def migrate_if_needed():
             st.success("Migrasi selesai. Tabel lama disimpan sebagai _backup.")
         except Exception as e:
             conn.rollback()
-            st.error(f"Migrisi gagal: {e}")
+            st.error(f"Migrasi gagal: {e}")
         finally:
             cur.execute("PRAGMA foreign_keys=ON")
 
 def init_db():
     with connect() as conn:
-        c = conn.cursor
         c = conn.cursor()
         c.execute(f"""
             CREATE TABLE IF NOT EXISTS {TABLE} (
@@ -156,15 +154,9 @@ def init_db():
         conn.commit()
 
 # =========================
-# Helper CRUD & Loader (bagian lama — tidak diubah)
+# Helper CRUD & Loader (lama)
 # =========================
 def load_hmhi_to_kode():
-    """
-    Ambil pilihan dari identitas_organisasi.hmhi_cabang dan petakan ke kode_organisasi.
-    Return:
-        mapping: dict {hmhi_cabang -> kode_organisasi}
-        options: list hmhi_cabang (urut alfabet)
-    """
     with connect() as conn:
         try:
             df = pd.read_sql_query(
@@ -199,7 +191,6 @@ def insert_row(payload: dict, kode_organisasi: str):
         cols = ", ".join(payload.keys())
         placeholders = ", ".join(["?"] * len(payload))
         vals = [payload[k] for k in payload]
-        # created_at TEXT UTC ISO → aman untuk Excel (tanpa tz)
         c.execute(
             f"INSERT INTO {TABLE} (kode_organisasi, created_at, {cols}) VALUES (?, ?, {placeholders})",
             [kode_organisasi, datetime.utcnow().isoformat()] + vals
@@ -250,7 +241,7 @@ with tab_input:
             key="thjk::hmhi_select"
         )
 
-    # ---------- Tabel 1: Penyandang Laki-laki (tidak diubah) ----------
+    # ---------- Tabel 1: Penyandang Laki-laki ----------
     st.subheader("👨 Penyandang Laki-laki")
     df_lk = pd.DataFrame(
         0,
@@ -270,10 +261,8 @@ with tab_input:
             use_container_width=True,
             num_rows="fixed",
         )
-        # Total per baris (HA lk & HB lk)
         for row_label in ["Hemofilia A laki-laki", "Hemofilia B laki-laki"]:
             ed_lk.loc[row_label, TOTAL_COL] = sum(_to_nonneg_int(ed_lk.loc[row_label, c]) for c, _ in SEVERITY_COLS)
-        # Baris Total Laki-laki = penjumlahan 2 baris di atas per kolom
         for c, _ in SEVERITY_COLS:
             ed_lk.loc["Total Laki-laki", c] = _to_nonneg_int(ed_lk.loc["Hemofilia A laki-laki", c]) + _to_nonneg_int(ed_lk.loc["Hemofilia B laki-laki", c])
         ed_lk.loc["Total Laki-laki", TOTAL_COL] = sum(_to_nonneg_int(ed_lk.loc["Total Laki-laki", c]) for c, _ in SEVERITY_COLS)
@@ -337,14 +326,13 @@ with tab_input:
                     ringan  = _to_nonneg_int(ed_pr_new.loc[jh, "ringan"])
                     sedang  = _to_nonneg_int(ed_pr_new.loc[jh, "sedang"])
                     berat   = _to_nonneg_int(ed_pr_new.loc[jh, "berat"])
-                    # Simpan ke Postgres (pakai STRING SQL, bukan TextClause)
                     exec_sql(
-                        """
-                        INSERT INTO public.hemofilia_perempuan
-                            (jenis_hemofilia, carrier, ringan, sedang, berat)
-                        VALUES
-                            (:jenis_hemofilia, :carrier, :ringan, :sedang, :berat)
-                        """,
+                        text("""
+                            INSERT INTO public.hemofilia_perempuan
+                                (jenis_hemofilia, carrier, ringan, sedang, berat)
+                            VALUES
+                                (:jenis_hemofilia, :carrier, :ringan, :sedang, :berat)
+                        """),
                         {
                             "jenis_hemofilia": jh,
                             "carrier": carrier,
@@ -362,11 +350,11 @@ with tab_input:
 # =========================
 with tab_data:
     st.subheader("📄 Data Tersimpan")
+
+    # ----- 1) Data Tingkat Hemofilia & JK (SQLite) -----
     df = read_with_join(limit=500)
 
     st.caption("Gunakan template berikut saat mengunggah data (kolom harus sesuai).")
-
-    # (1) Template lama — untuk upload 'tingkat_hemofilia_jenis_kelamin' (tetap)
     template_rows = [
         {"HMHI cabang": "", "Baris": "Hemofilia A laki-laki", "Ringan (>5%)": 0, "Sedang (1-5%)": 0, "Berat (<1%)": 0, "Tidak diketahui": 0, "Total": 0},
         {"HMHI cabang": "", "Baris": "Hemofilia B laki-laki", "Ringan (>5%)": 0, "Sedang (1-5%)": 0, "Berat (<1%)": 0, "Tidak diketahui": 0, "Total": 0},
@@ -387,42 +375,9 @@ with tab_data:
         key="thjk::dl_template"
     )
 
-    # (2) Template khusus Penyandang Perempuan — ada kolom HMHI Cabang + sheet referensi
-    st.caption("Atau gunakan template khusus untuk input Penyandang Perempuan (Postgres: public.hemofilia_perempuan).")
-    female_template_rows = [
-        {
-            "HMHI Cabang": "",
-            "Jenis Hemofilia": "Hemofilia A perempuan",
-            "Carrier (>40%)": 0, "Ringan (>5%)": 0, "Sedang (1-5%)": 0, "Berat (<1%)": 0
-        },
-        {
-            "HMHI Cabang": "",
-            "Jenis Hemofilia": "Hemofilia B perempuan",
-            "Carrier (>40%)": 0, "Ringan (>5%)": 0, "Sedang (1-5%)": 0, "Berat (<1%)": 0
-        },
-    ]
-    female_tmpl_df = pd.DataFrame(female_template_rows, columns=FEMALE_TEMPLATE_COLUMNS)
-
-    hmhi_map_ref, _ = load_hmhi_to_kode()
-    ref_rows = [{"HMHI Cabang": k, "kode_organisasi": v} for k, v in hmhi_map_ref.items()]
-    ref_df = pd.DataFrame(ref_rows, columns=["HMHI Cabang", "kode_organisasi"])
-
-    buf_tmpl_f = io.BytesIO()
-    with pd.ExcelWriter(buf_tmpl_f, engine="xlsxwriter") as w:
-        female_tmpl_df.to_excel(w, index=False, sheet_name="PenyandangPerempuan")
-        (ref_df if not ref_df.empty else pd.DataFrame(columns=["HMHI Cabang", "kode_organisasi"])) \
-            .to_excel(w, index=False, sheet_name="ReferensiHMHI")
-    st.download_button(
-        "📥 Unduh Template Excel (Penyandang Perempuan)",
-        buf_tmpl_f.getvalue(),
-        file_name="template_penyandang_perempuan.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        key="thjk::dl_template_female"
-    )
-
-    # ====== Tabel tampilan ======
+    # Tabel tampil (JK)
     if df.empty:
-        st.info("Belum ada data.")
+        st.info("Belum ada data JK.")
     else:
         order = ["hmhi_cabang", "kota_cakupan_cabang", "created_at", "label",
                  "ringan", "sedang", "berat", "tidak_diketahui", "total"]
@@ -444,11 +399,66 @@ with tab_data:
         with pd.ExcelWriter(buffer, engine="xlsxwriter") as w:
             view.to_excel(w, index=False, sheet_name="TingkatHemofiliaJK")
         st.download_button(
-            "⬇️ Unduh Excel (Data Tersimpan)",
+            "⬇️ Unduh Excel (Data Tersimpan JK)",
             buffer.getvalue(),
             file_name="tingkat_hemofilia_jenis_kelamin.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             key="thjk::download"
+        )
+
+    st.divider()
+
+    # ----- 2) 🆕 Data Penyandang Perempuan (Postgres) -----
+    st.subheader("👩 Data Tersimpan — Penyandang Perempuan (Postgres)")
+
+    # Query dengan string biasa (bukan TextClause) agar cocok dengan read_sql_df
+    sql_female = """
+        SELECT
+          hp.id,
+          hp.created_at,
+          hp.kode_organisasi,
+          io.hmhi_cabang,
+          io.kota_cakupan_cabang,
+          hp.jenis_hemofilia,
+          hp.carrier,
+          hp.ringan,
+          hp.sedang,
+          hp.berat
+        FROM public.hemofilia_perempuan hp
+        LEFT JOIN public.identitas_organisasi io
+          ON io.kode_organisasi = hp.kode_organisasi
+        ORDER BY hp.id DESC
+        LIMIT :lim
+    """
+    df_female = read_sql_df(sql_female, params={"lim": 500}) or pd.DataFrame()
+
+    if df_female.empty:
+        st.info("Belum ada data Penyandang Perempuan.")
+    else:
+        order_f = ["hmhi_cabang", "kota_cakupan_cabang", "created_at",
+                   "jenis_hemofilia", "carrier", "ringan", "sedang", "berat"]
+        order_f = [c for c in order_f if c in df_female.columns]
+        view_f = df_female[order_f].rename(columns={
+            "hmhi_cabang": "HMHI cabang",
+            "kota_cakupan_cabang": "Kota/Provinsi Cakupan Cabang",
+            "created_at": "Created At",
+            "jenis_hemofilia": "Jenis Hemofilia",
+            "carrier": "Carrier (>40%)",
+            "ringan": "Ringan (>5%)",
+            "sedang": "Sedang (1-5%)",
+            "berat": "Berat (<1%)",
+        })
+        st.dataframe(view_f, use_container_width=True)
+
+        buf_f = io.BytesIO()
+        with pd.ExcelWriter(buf_f, engine="xlsxwriter") as w:
+            view_f.to_excel(w, index=False, sheet_name="PenyandangPerempuan")
+        st.download_button(
+            "⬇️ Unduh Excel (Penyandang Perempuan)",
+            buf_f.getvalue(),
+            file_name="penyandang_perempuan.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="thjk::download_female"
         )
 
     # ====== Unggah Excel ======
@@ -469,7 +479,6 @@ with tab_data:
             st.stop()
 
         cols = set(raw.columns)
-
         is_general = set(TEMPLATE_COLUMNS).issubset(cols)
         is_female  = set(FEMALE_TEMPLATE_COLUMNS).issubset(cols)
 
@@ -482,21 +491,18 @@ with tab_data:
             )
             st.stop()
 
-        # ===== Jalur 1: Template Umum (tetap seperti sebelumnya) =====
+        # ===== Jalur 1: Template Umum =====
         if is_general:
             df_up = raw.rename(columns=ALIAS_TO_DB).copy()
-
-            # Pratinjau
             st.caption("Pratinjau 20 baris pertama dari file yang diunggah:")
             st.dataframe(raw.head(20), use_container_width=True)
 
             if st.button("🚀 Proses & Simpan (Template Umum)", type="primary", key="thjk::process_general"):
                 hmhi_map, _ = load_hmhi_to_kode()
                 results = []
-
                 for i in range(len(df_up)):
                     try:
-                        s = df_up.iloc[i]  # pandas.Series
+                        s = df_up.iloc[i]
                         hmhi = str((s.get("hmhi_cabang_info") or "")).strip()
                         if not hmhi:
                             raise ValueError("Kolom 'HMHI cabang' kosong.")
@@ -555,14 +561,12 @@ with tab_data:
         # ===== Jalur 2: Template Penyandang Perempuan =====
         if is_female:
             df_fp = raw.rename(columns=FEMALE_ALIAS).copy()
-
             st.caption("Pratinjau 20 baris pertama dari file yang diunggah (Penyandang Perempuan):")
             st.dataframe(raw.head(20), use_container_width=True)
 
             if st.button("🚀 Proses & Simpan (Penyandang Perempuan)", type="primary", key="thjk::process_female"):
                 hmhi_map, _ = load_hmhi_to_kode()
                 results_f = []
-
                 for i in range(len(df_fp)):
                     try:
                         s = df_fp.iloc[i]
@@ -582,15 +586,14 @@ with tab_data:
                         sedang  = _to_nonneg_int(s.get("sedang"))
                         berat   = _to_nonneg_int(s.get("berat"))
 
-                        # Simpan ke Postgres (pakai STRING SQL, bukan TextClause)
                         try:
                             exec_sql(
-                                """
-                                INSERT INTO public.hemofilia_perempuan
-                                    (kode_organisasi, jenis_hemofilia, carrier, ringan, sedang, berat)
-                                VALUES
-                                    (:kode_organisasi, :jenis_hemofilia, :carrier, :ringan, :sedang, :berat)
-                                """,
+                                text("""
+                                    INSERT INTO public.hemofilia_perempuan
+                                        (kode_organisasi, jenis_hemofilia, carrier, ringan, sedang, berat)
+                                    VALUES
+                                        (:kode_organisasi, :jenis_hemofilia, :carrier, :ringan, :sedang, :berat)
+                                """),
                                 {
                                     "kode_organisasi": kode_organisasi,
                                     "jenis_hemofilia": jenis,
@@ -601,14 +604,13 @@ with tab_data:
                                 }
                             )
                         except Exception:
-                            # fallback jika kolom kode_organisasi belum ada
                             exec_sql(
-                                """
-                                INSERT INTO public.hemofilia_perempuan
-                                    (jenis_hemofilia, carrier, ringan, sedang, berat)
-                                VALUES
-                                    (:jenis_hemofilia, :carrier, :ringan, :sedang, :berat)
-                                """,
+                                text("""
+                                    INSERT INTO public.hemofilia_perempuan
+                                        (jenis_hemofilia, carrier, ringan, sedang, berat)
+                                    VALUES
+                                        (:jenis_hemofilia, :carrier, :ringan, :sedang, :berat)
+                                """),
                                 {
                                     "jenis_hemofilia": jenis,
                                     "carrier": carrier,
