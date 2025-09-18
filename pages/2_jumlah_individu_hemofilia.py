@@ -5,7 +5,6 @@ from datetime import datetime
 import io
 from db import read_sql_df, exec_sql, get_engine, ping
 from sqlalchemy import text
-from datetime import datetime
 
 IS_PG = (ping() == 'postgresql')
 
@@ -75,7 +74,7 @@ def load_hmhi_to_kode():
     with connect() as conn:
         try:
             sql = f"SELECT kode_organisasi, hmhi_cabang FROM {ORG_TABLE} ORDER BY id DESC"
-            df = read_sql_df(text(sql) if IS_PG else sql, conn)
+            df = read_sql_df(text(sql) if IS_PG else sql, conn=conn)
             if df.empty:
                 return {}
             return {row["hmhi_cabang"]: row["kode_organisasi"] for _, row in df.iterrows()}
@@ -89,7 +88,7 @@ def kode_organisasi_exists(kode: str) -> bool:
         if IS_PG:
             df = read_sql_df(
                 text(f"SELECT 1 FROM {ORG_TABLE} WHERE kode_organisasi = :k LIMIT 1"),
-                conn,
+                conn=conn,
                 params={"k": kode},
             )
             return not df.empty
@@ -139,9 +138,9 @@ def read_with_kota(limit=300):
             ORDER BY j.id DESC
         """
         if IS_PG:
-            return read_sql_df(text(select_sql + " LIMIT :lim"), conn, params={"lim": int(limit)})
+            return read_sql_df(text(select_sql + " LIMIT :lim"), conn=conn, params={"lim": int(limit)})
         else:
-            return read_sql_df(select_sql + " LIMIT ?", conn, params=[int(limit)])
+            return read_sql_df(select_sql + " LIMIT ?", conn=conn, params=[int(limit)])
 
 def to_nonneg_int(x) -> int:
     """Konversi ke int >=0; kosong/NaN -> 0, negatif -> 0."""
