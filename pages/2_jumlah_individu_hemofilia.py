@@ -74,7 +74,8 @@ def load_hmhi_to_kode():
     with connect() as conn:
         try:
             sql = f"SELECT kode_organisasi, hmhi_cabang FROM {ORG_TABLE} ORDER BY id DESC"
-            df = read_sql_df(text(sql) if IS_PG else sql, conn=conn)
+            # read_sql_df(sql, params, conn) -> params=None untuk tanpa parameter
+            df = read_sql_df(text(sql) if IS_PG else sql, None, conn)
             if df.empty:
                 return {}
             return {row["hmhi_cabang"]: row["kode_organisasi"] for _, row in df.iterrows()}
@@ -88,8 +89,8 @@ def kode_organisasi_exists(kode: str) -> bool:
         if IS_PG:
             df = read_sql_df(
                 text(f"SELECT 1 FROM {ORG_TABLE} WHERE kode_organisasi = :k LIMIT 1"),
-                conn=conn,
-                params={"k": kode},
+                {"k": kode},
+                conn,
             )
             return not df.empty
         else:
@@ -138,9 +139,9 @@ def read_with_kota(limit=300):
             ORDER BY j.id DESC
         """
         if IS_PG:
-            return read_sql_df(text(select_sql + " LIMIT :lim"), conn=conn, params={"lim": int(limit)})
+            return read_sql_df(text(select_sql + " LIMIT :lim"), {"lim": int(limit)}, conn)
         else:
-            return read_sql_df(select_sql + " LIMIT ?", conn=conn, params=[int(limit)])
+            return read_sql_df(select_sql + " LIMIT ?", [int(limit)], conn)
 
 def to_nonneg_int(x) -> int:
     """Konversi ke int >=0; kosong/NaN -> 0, negatif -> 0."""
@@ -286,6 +287,15 @@ with tab_data:
         if st.button("🚀 Proses & Simpan", type="primary", key="jml::process"):
             hmhi_map = load_hmhi_to_kode()
             results = []
+
+            def to_nonneg_int(x) -> int:
+                try:
+                    if pd.isna(x) or str(x).strip() == "":
+                        return 0
+                    v = int(float(x))
+                    return max(v, 0)
+                except Exception:
+                    return 0
 
             for i, row in df_up.iterrows():
                 try:
