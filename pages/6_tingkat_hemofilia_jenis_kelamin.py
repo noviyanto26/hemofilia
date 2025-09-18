@@ -357,26 +357,53 @@ with tab_data:
     st.subheader("📄 Data Tersimpan")
     df = read_with_join(limit=500)
 
-    # ====== Unduh Template Excel ======
+        # ====== Unduh Template Excel ======
     st.caption("Gunakan template berikut saat mengunggah data (kolom harus sesuai).")
+
+    # (1) Template lama — untuk upload 'tingkat_hemofilia_jenis_kelamin' (tetap)
     template_rows = [
         {"HMHI cabang": "", "Baris": "Hemofilia A laki-laki", "Ringan (>5%)": 0, "Sedang (1-5%)": 0, "Berat (<1%)": 0, "Tidak diketahui": 0, "Total": 0},
         {"HMHI cabang": "", "Baris": "Hemofilia B laki-laki", "Ringan (>5%)": 0, "Sedang (1-5%)": 0, "Berat (<1%)": 0, "Tidak diketahui": 0, "Total": 0},
-        {"HMHI cabang": "", "Baris": "Total Laki-laki", "Ringan (>5%)": 0, "Sedang (1-5%)": 0, "Berat (<1%)": 0, "Tidak diketahui": 0, "Total": 0},
-        {"HMHI cabang": "", "Baris": "Hemofilia A perempuan", "Ringan (>5%)": 0, "Sedang (1-5%)": 0, "Berat (<1%)": 0, "Tidak diketahui": 0, "Total": 0},
-        {"HMHI cabang": "", "Baris": "Hemofilia B perempuan", "Ringan (>5%)": 0, "Sedang (1-5%)": 0, "Berat (<1%)": 0, "Tidak diketahui": 0, "Total": 0},
-        {"HMHI cabang": "", "Baris": "Total Perempuan", "Ringan (>5%)": 0, "Sedang (1-5%)": 0, "Berat (<1%)": 0, "Tidak diketahui": 0, "Total": 0},
+        {"HMHI cabang": "", "Baris": "Total Laki-laki",       "Ringan (>5%)": 0, "Sedang (1-5%)": 0, "Berat (<1%)": 0, "Tidak diketahui": 0, "Total": 0},
+        {"HMHI cabang": "", "Baris": "Hemofilia A perempuan",  "Ringan (>5%)": 0, "Sedang (1-5%)": 0, "Berat (<1%)": 0, "Tidak diketahui": 0, "Total": 0},
+        {"HMHI cabang": "", "Baris": "Hemofilia B perempuan",  "Ringan (>5%)": 0, "Sedang (1-5%)": 0, "Berat (<1%)": 0, "Tidak diketahui": 0, "Total": 0},
+        {"HMHI cabang": "", "Baris": "Total Perempuan",        "Ringan (>5%)": 0, "Sedang (1-5%)": 0, "Berat (<1%)": 0, "Tidak diketahui": 0, "Total": 0},
     ]
     tmpl_df = pd.DataFrame(template_rows, columns=TEMPLATE_COLUMNS)
     buf_tmpl = io.BytesIO()
     with pd.ExcelWriter(buf_tmpl, engine="xlsxwriter") as w:
         tmpl_df.to_excel(w, index=False, sheet_name="Template")
     st.download_button(
-        "📥 Unduh Template Excel",
+        "📥 Unduh Template Excel (Tingkat Hemofilia & JK)",
         buf_tmpl.getvalue(),
         file_name="template_tingkat_hemofilia_jenis_kelamin.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         key="thjk::dl_template"
+    )
+
+    # (2) 🆕 Template khusus Penyandang Perempuan — untuk table public.hemofilia_perempuan
+    st.caption("Atau gunakan template khusus untuk input Penyandang Perempuan (Postgres: public.hemofilia_perempuan).")
+    FEMALE_TEMPLATE_COLUMNS = [
+        "Jenis Hemofilia",
+        "Carrier (>40%)",
+        "Ringan (>5%)",
+        "Sedang (1-5%)",
+        "Berat (<1%)",
+    ]
+    female_template_rows = [
+        {"Jenis Hemofilia": "Hemofilia A perempuan", "Carrier (>40%)": 0, "Ringan (>5%)": 0, "Sedang (1-5%)": 0, "Berat (<1%)": 0},
+        {"Jenis Hemofilia": "Hemofilia B perempuan", "Carrier (>40%)": 0, "Ringan (>5%)": 0, "Sedang (1-5%)": 0, "Berat (<1%)": 0},
+    ]
+    female_tmpl_df = pd.DataFrame(female_template_rows, columns=FEMALE_TEMPLATE_COLUMNS)
+    buf_tmpl_f = io.BytesIO()
+    with pd.ExcelWriter(buf_tmpl_f, engine="xlsxwriter") as w:
+        female_tmpl_df.to_excel(w, index=False, sheet_name="PenyandangPerempuan")
+    st.download_button(
+        "📥 Unduh Template Excel (Penyandang Perempuan)",
+        buf_tmpl_f.getvalue(),
+        file_name="template_penyandang_perempuan.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="thjk::dl_template_female"
     )
 
     # ====== Tabel tampilan ======
