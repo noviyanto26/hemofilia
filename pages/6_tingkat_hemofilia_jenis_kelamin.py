@@ -308,7 +308,7 @@ with tab_input:
             use_container_width=True,
             num_rows="fixed",
         )
-        submit_pr_new = st.form_submit_button("💾 Simpan Data Perempuan (ke Postgres)")
+        submit_pr_new = st.form_submit_button("💾 Simpan Data Penyandang Perempuan")
 
     if submit_pr_new:
         if not selected_hmhi:
