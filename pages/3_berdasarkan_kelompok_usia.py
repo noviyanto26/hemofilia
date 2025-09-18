@@ -53,8 +53,10 @@ def load_hmhi_to_kode():
         )
         if df.empty:
             return {}, []
-        mapping = {str(r["hmhi_cabang"]).strip(): str(r["kode_organisasi"]).strip()
-                   for _, r in df.iterrows() if pd.notna(r["hmhi_cabang"])}
+        mapping = {
+            str(r["hmhi_cabang"]).strip(): str(r["kode_organisasi"]).strip()
+            for _, r in df.iterrows() if pd.notna(r["hmhi_cabang"])
+        }
         return mapping, sorted(mapping.keys())
     except Exception:
         return {}, []
@@ -74,7 +76,7 @@ def insert_row(row: dict, kode_organisasi: str):
 
 def read_with_join(limit=300):
     usia_cols = ", ".join([f"ku.{n}" for n, _ in USIA_COLUMNS])
-    sql = text(f"""
+    sql = f"""
         SELECT
           ku.id, ku.kode_organisasi, ku.created_at, ku.kelompok_usia,
           {usia_cols},
@@ -84,7 +86,7 @@ def read_with_join(limit=300):
         LEFT JOIN {ORG_TABLE} io ON io.kode_organisasi = ku.kode_organisasi
         ORDER BY ku.id DESC
         LIMIT :lim
-    """)
+    """
     return read_sql_df(sql, params={"lim": int(limit)})
 
 def to_nonneg_int(x) -> int:
@@ -139,20 +141,18 @@ with tab_input:
                 rows_skipped_all_zero = 0
                 for usia, row in edited.iterrows():
                     payload = {"kelompok_usia": str(usia)}
-                    nums = {}
-                    for n, _ in USIA_COLUMNS:
-                        num = to_nonneg_int(row.get(n, 0))
-                        nums[n] = num
+                    nums = {n: to_nonneg_int(row.get(n, 0)) for n, _ in USIA_COLUMNS}
                     if all(v == 0 for v in nums.values()):
                         rows_skipped_all_zero += 1
                         continue
                     payload.update(nums)
                     insert_row(payload, kode_organisasi)
                     rows_inserted += 1
-                cnt = read_sql_df(
-                    text(f"SELECT COUNT(*) AS n FROM {TABLE} WHERE kode_organisasi=:k"),
+                cnt_df = read_sql_df(
+                    f"SELECT COUNT(*) AS n FROM {TABLE} WHERE kode_organisasi=:k",
                     params={"k": kode_organisasi}
-                )["n"].iloc[0]
+                )
+                cnt = cnt_df["n"].iloc[0] if not cnt_df.empty else 0
                 st.success(
                     f"{rows_inserted} baris disimpan untuk **{selected_hmhi}** "
                     f"(dilewati {rows_skipped_all_zero} baris karena semua kolom bernilai 0). "
@@ -164,6 +164,7 @@ with tab_data:
     df_x = read_with_join()
     st.caption("Gunakan template berikut saat mengunggah data (kolom & urutan baris Kelompok Usia disarankan).")
 
+    # Template Excel
     tmpl_records = []
     for usia in TEMPLATE_AGE_ORDER:
         row = {"HMHI cabang": "", "Kelompok Usia": usia}
@@ -182,6 +183,7 @@ with tab_data:
         key="usia::dl_template"
     )
 
+    # Tabel tampilan
     if df_x.empty:
         st.info("Belum ada data.")
     else:
@@ -194,6 +196,8 @@ with tab_data:
             "kelompok_usia": "Kelompok Usia",
         })
         st.dataframe(view, use_container_width=True)
+
+        # Unduh Excel data tampilan
         buf_now = io.BytesIO()
         with pd.ExcelWriter(buf_now, engine="xlsxwriter") as w:
             view.to_excel(w, index=False, sheet_name="KelompokUsia")
@@ -205,6 +209,7 @@ with tab_data:
             key="usia::download"
         )
 
+    # Unggah Excel
     st.markdown("### ⬆️ Unggah Excel")
     up = st.file_uploader(
         "Pilih file Excel (.xlsx) dengan header persis seperti template",
@@ -218,10 +223,12 @@ with tab_data:
         except Exception as e:
             st.error(f"Gagal membaca file: {e}")
             st.stop()
+
         missing = [c for c in TEMPLATE_COLUMNS if c not in raw.columns]
         if missing:
             st.error("Header kolom tidak sesuai. Kolom yang belum ada: " + ", ".join(missing))
             st.stop()
+
         df_up = raw.rename(columns=ALIAS_TO_DB).copy()
         st.caption("Pratinjau 20 baris pertama dari file yang diunggah:")
         st.dataframe(raw.head(20), use_container_width=True)
@@ -237,26 +244,29 @@ with tab_data:
                     kode_organisasi = hmhi_map.get(hmhi)
                     if not kode_organisasi:
                         raise ValueError(f"HMHI cabang '{hmhi}' tidak ditemukan di identitas_organisasi.")
-                    payload = {}
-                    for key, _lbl in USIA_COLUMNS:
-                        payload[key] = to_nonneg_int(s.get(key, 0))
+
+                    payload = {key: to_nonneg_int(s.get(key, 0)) for key, _ in USIA_COLUMNS}
                     kelompok = str((s.get("kelompok_usia") or "")).strip()
                     if not kelompok:
                         raise ValueError("Kolom 'Kelompok Usia' kosong.")
                     payload["kelompok_usia"] = kelompok
+
                     insert_row(payload, kode_organisasi)
-                    results.append({"Baris": i+2, "Status": "OK", "Keterangan": f"Simpan → {hmhi} / {kelompok}"})
+                    results.append({"Baris": i + 2, "Status": "OK", "Keterangan": f"Simpan → {hmhi} / {kelompok}"})
                 except Exception as e:
-                    results.append({"Baris": i+2, "Status": "GAGAL", "Keterangan": str(e)})
+                    results.append({"Baris": i + 2, "Status": "GAGAL", "Keterangan": str(e)})
+
             res_df = pd.DataFrame(results)
             st.write("**Hasil unggah:**")
             st.dataframe(res_df, use_container_width=True)
+
             ok = (res_df["Status"] == "OK").sum()
             fail = (res_df["Status"] == "GAGAL").sum()
             if ok:
                 st.success(f"Berhasil menyimpan {ok} baris.")
             if fail:
                 st.error(f"Gagal menyimpan {fail} baris.")
+
             log_buf = io.BytesIO()
             with pd.ExcelWriter(log_buf, engine="xlsxwriter") as w:
                 res_df.to_excel(w, index=False, sheet_name="Hasil")
