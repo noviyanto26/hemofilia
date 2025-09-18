@@ -50,6 +50,24 @@ ALIAS_TO_DB = {
     "Total": "total",
 }
 
+# 🆕 Template unggah khusus Penyandang Perempuan
+FEMALE_TEMPLATE_COLUMNS = [
+    "HMHI Cabang",
+    "Jenis Hemofilia",
+    "Carrier (>40%)",
+    "Ringan (>5%)",
+    "Sedang (1-5%)",
+    "Berat (<1%)",
+]
+FEMALE_ALIAS = {
+    "HMHI Cabang": "hmhi_cabang",
+    "Jenis Hemofilia": "jenis_hemofilia",
+    "Carrier (>40%)": "carrier",
+    "Ringan (>5%)": "ringan",
+    "Sedang (1-5%)": "sedang",
+    "Berat (<1%)": "berat",
+}
+
 # =========================
 # Utilitas Database (SQLite untuk bagian lama — tidak diubah)
 # =========================
@@ -285,10 +303,9 @@ with tab_input:
 
     st.divider()
 
-    # ---------- Tabel 2: Penyandang Perempuan (🆕 dimodifikasi sesuai permintaan) ----------
+    # ---------- Tabel 2: Penyandang Perempuan ----------
     st.subheader("👩 Penyandang Perempuan")
 
-    # Tabel input baru: hanya 2 baris + 4 kolom (Carrier, Ringan, Sedang, Berat)
     FEMALE_ROWS = ["Hemofilia A perempuan", "Hemofilia B perempuan"]
     FEMALE_COLS = [
         ("carrier", "Carrier (>40%)"),
@@ -314,23 +331,13 @@ with tab_input:
         if not selected_hmhi:
             st.error("Pilih HMHI cabang terlebih dahulu.")
         else:
-            # Insert ke Postgres: public.hemofilia_perempuan
-            # Skema:
-            #   id SERIAL PK
-            #   jenis_hemofilia TEXT NOT NULL
-            #   carrier INTEGER DEFAULT 0
-            #   ringan  INTEGER DEFAULT 0
-            #   sedang  INTEGER DEFAULT 0
-            #   berat   INTEGER DEFAULT 0
-            #   created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT now()
             try:
                 for jh in ed_pr_new.index.tolist():
                     carrier = _to_nonneg_int(ed_pr_new.loc[jh, "carrier"])
                     ringan  = _to_nonneg_int(ed_pr_new.loc[jh, "ringan"])
                     sedang  = _to_nonneg_int(ed_pr_new.loc[jh, "sedang"])
                     berat   = _to_nonneg_int(ed_pr_new.loc[jh, "berat"])
-
-                    # gunakan exec_sql dari modul db (Postgres)
+                    # Simpan ke Postgres
                     exec_sql(
                         text("""
                             INSERT INTO public.hemofilia_perempuan
@@ -351,13 +358,12 @@ with tab_input:
                 st.error(f"Gagal menyimpan data perempuan ke Postgres: {e}")
 
 # =========================
-# Data Tersimpan & Unggah Excel (tidak diubah kecuali template perempuan)
+# Data Tersimpan & Unggah Excel
 # =========================
 with tab_data:
     st.subheader("📄 Data Tersimpan")
     df = read_with_join(limit=500)
 
-    # ====== Unduh Template Excel ======
     st.caption("Gunakan template berikut saat mengunggah data (kolom harus sesuai).")
 
     # (1) Template lama — untuk upload 'tingkat_hemofilia_jenis_kelamin' (tetap)
@@ -381,16 +387,8 @@ with tab_data:
         key="thjk::dl_template"
     )
 
-    # (2) 🆕 Template khusus Penyandang Perempuan — tambahkan kolom HMHI Cabang + sheet referensi
+    # (2) Template khusus Penyandang Perempuan — ada kolom HMHI Cabang + sheet referensi
     st.caption("Atau gunakan template khusus untuk input Penyandang Perempuan (Postgres: public.hemofilia_perempuan).")
-    FEMALE_TEMPLATE_COLUMNS = [
-        "HMHI Cabang",           # 🆕 untuk relasi ke identitas_organisasi via kode_organisasi
-        "Jenis Hemofilia",
-        "Carrier (>40%)",
-        "Ringan (>5%)",
-        "Sedang (1-5%)",
-        "Berat (<1%)",
-    ]
     female_template_rows = [
         {
             "HMHI Cabang": "",
@@ -405,7 +403,6 @@ with tab_data:
     ]
     female_tmpl_df = pd.DataFrame(female_template_rows, columns=FEMALE_TEMPLATE_COLUMNS)
 
-    # Sheet referensi HMHI ↔ kode_organisasi dari tabel identitas_organisasi
     hmhi_map_ref, _ = load_hmhi_to_kode()
     ref_rows = [{"HMHI Cabang": k, "kode_organisasi": v} for k, v in hmhi_map_ref.items()]
     ref_df = pd.DataFrame(ref_rows, columns=["HMHI Cabang", "kode_organisasi"])
@@ -427,7 +424,6 @@ with tab_data:
     if df.empty:
         st.info("Belum ada data.")
     else:
-        # HANYA kota/provinsi + waktu + label + angka (tanpa kode_organisasi & is_total_row)
         order = ["hmhi_cabang", "kota_cakupan_cabang", "created_at", "label",
                  "ringan", "sedang", "berat", "tidak_diketahui", "total"]
         order = [c for c in order if c in df.columns]
@@ -444,7 +440,6 @@ with tab_data:
         })
         st.dataframe(view, use_container_width=True)
 
-        # Unduh Excel (tampilan)
         buffer = io.BytesIO()
         with pd.ExcelWriter(buffer, engine="xlsxwriter") as w:
             view.to_excel(w, index=False, sheet_name="TingkatHemofiliaJK")
@@ -458,8 +453,9 @@ with tab_data:
 
     # ====== Unggah Excel ======
     st.markdown("### ⬆️ Unggah Excel")
+    st.caption("Anda bisa mengunggah salah satu: (1) Template Tingkat Hemofilia & JK, atau (2) Template Penyandang Perempuan.")
     up = st.file_uploader(
-        "Pilih file Excel (.xlsx) dengan header persis seperti template",
+        "Pilih file Excel (.xlsx) dengan header persis seperti template yang diunduh",
         type=["xlsx"],
         key="thjk::uploader"
     )
@@ -472,77 +468,178 @@ with tab_data:
             st.error(f"Gagal membaca file: {e}")
             st.stop()
 
-        # Validasi header
-        missing = [c for c in TEMPLATE_COLUMNS if c not in raw.columns]
-        if missing:
-            st.error("Header kolom tidak sesuai. Kolom yang belum ada: " + ", ".join(missing))
+        cols = set(raw.columns)
+
+        is_general = set(TEMPLATE_COLUMNS).issubset(cols)
+        is_female  = set(FEMALE_TEMPLATE_COLUMNS).issubset(cols)
+
+        if not is_general and not is_female:
+            st.error(
+                "Header kolom tidak sesuai. "
+                "Unggah salah satu template berikut:\n"
+                f"- Template umum: {', '.join(TEMPLATE_COLUMNS)}\n"
+                f"- Template perempuan: {', '.join(FEMALE_TEMPLATE_COLUMNS)}"
+            )
             st.stop()
 
-        df_up = raw.rename(columns=ALIAS_TO_DB).copy()
+        # ===== Jalur 1: Template Umum (tetap seperti sebelumnya) =====
+        if is_general:
+            df_up = raw.rename(columns=ALIAS_TO_DB).copy()
 
-        # Pratinjau
-        st.caption("Pratinjau 20 baris pertama dari file yang diunggah:")
-        st.dataframe(raw.head(20), use_container_width=True)
+            # Pratinjau
+            st.caption("Pratinjau 20 baris pertama dari file yang diunggah:")
+            st.dataframe(raw.head(20), use_container_width=True)
 
-        if st.button("🚀 Proses & Simpan", type="primary", key="thjk::process"):
-            hmhi_map, _ = load_hmhi_to_kode()
-            results = []
+            if st.button("🚀 Proses & Simpan (Template Umum)", type="primary", key="thjk::process_general"):
+                hmhi_map, _ = load_hmhi_to_kode()
+                results = []
 
-            for i in range(len(df_up)):
-                try:
-                    s = df_up.iloc[i]  # pandas.Series
-                    hmhi = str((s.get("hmhi_cabang_info") or "")).strip()
-                    if not hmhi:
-                        raise ValueError("Kolom 'HMHI cabang' kosong.")
-                    kode_organisasi = hmhi_map.get(hmhi)
-                    if not kode_organisasi:
-                        raise ValueError(f"HMHI cabang '{hmhi}' tidak ditemukan di identitas_organisasi.")
+                for i in range(len(df_up)):
+                    try:
+                        s = df_up.iloc[i]  # pandas.Series
+                        hmhi = str((s.get("hmhi_cabang_info") or "")).strip()
+                        if not hmhi:
+                            raise ValueError("Kolom 'HMHI cabang' kosong.")
+                        kode_organisasi = hmhi_map.get(hmhi)
+                        if not kode_organisasi:
+                            raise ValueError(f"HMHI cabang '{hmhi}' tidak ditemukan di identitas_organisasi.")
 
-                    label = str((s.get("label") or "")).strip()
-                    if not label:
-                        raise ValueError("Kolom 'Baris' kosong.")
+                        label = str((s.get("label") or "")).strip()
+                        if not label:
+                            raise ValueError("Kolom 'Baris' kosong.")
 
-                    ringan = _to_nonneg_int(s.get("ringan"))
-                    sedang = _to_nonneg_int(s.get("sedang"))
-                    berat = _to_nonneg_int(s.get("berat"))
-                    td = _to_nonneg_int(s.get("tidak_diketahui"))
-                    total = _to_nonneg_int(s.get("total"))
-                    if total == 0 and (ringan or sedang or berat or td):
-                        total = ringan + sedang + berat + td
+                        ringan = _to_nonneg_int(s.get("ringan"))
+                        sedang = _to_nonneg_int(s.get("sedang"))
+                        berat = _to_nonneg_int(s.get("berat"))
+                        td = _to_nonneg_int(s.get("tidak_diketahui"))
+                        total = _to_nonneg_int(s.get("total"))
+                        if total == 0 and (ringan or sedang or berat or td):
+                            total = ringan + sedang + berat + td
 
-                    payload = {
-                        "label": label,
-                        "ringan": ringan,
-                        "sedang": sedang,
-                        "berat": berat,
-                        "tidak_diketahui": td,
-                        "total": total,
-                        "is_total_row": "1" if label.strip().lower().startswith("total ") else "0",
-                    }
-                    insert_row(payload, kode_organisasi)
-                    results.append({"Baris Excel": i + 2, "Status": "OK", "Keterangan": f"Simpan → {hmhi} / {label}"})
-                except Exception as e:
-                    results.append({"Baris Excel": i + 2, "Status": "GAGAL", "Keterangan": str(e)})
+                        payload = {
+                            "label": label,
+                            "ringan": ringan,
+                            "sedang": sedang,
+                            "berat": berat,
+                            "tidak_diketahui": td,
+                            "total": total,
+                            "is_total_row": "1" if label.strip().lower().startswith("total ") else "0",
+                        }
+                        insert_row(payload, kode_organisasi)
+                        results.append({"Baris Excel": i + 2, "Status": "OK", "Keterangan": f"Simpan → {hmhi} / {label}"})
+                    except Exception as e:
+                        results.append({"Baris Excel": i + 2, "Status": "GAGAL", "Keterangan": str(e)})
 
-            res_df = pd.DataFrame(results)
-            st.write("**Hasil unggah:**")
-            st.dataframe(res_df, use_container_width=True)
+                res_df = pd.DataFrame(results)
+                st.write("**Hasil unggah (Template Umum):**")
+                st.dataframe(res_df, use_container_width=True)
 
-            ok = (res_df["Status"] == "OK").sum()
-            fail = (res_df["Status"] == "GAGAL").sum()
-            if ok:
-                st.success(f"Berhasil menyimpan {ok} baris.")
-            if fail:
-                st.error(f"Gagal menyimpan {fail} baris.")
+                ok = (res_df["Status"] == "OK").sum()
+                fail = (res_df["Status"] == "GAGAL").sum()
+                if ok:
+                    st.success(f"Berhasil menyimpan {ok} baris.")
+                if fail:
+                    st.error(f"Gagal menyimpan {fail} baris.")
 
-            # Unduh log hasil
-            log_buf = io.BytesIO()
-            with pd.ExcelWriter(log_buf, engine="xlsxwriter") as w:
-                res_df.to_excel(w, index=False, sheet_name="Hasil")
-            st.download_button(
-                "📄 Unduh Log Hasil",
-                log_buf.getvalue(),
-                file_name="log_hasil_unggah_tingkat_jk.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                key="thjk::dl_log"
-            )
+                log_buf = io.BytesIO()
+                with pd.ExcelWriter(log_buf, engine="xlsxwriter") as w:
+                    res_df.to_excel(w, index=False, sheet_name="Hasil")
+                st.download_button(
+                    "📄 Unduh Log Hasil",
+                    log_buf.getvalue(),
+                    file_name="log_hasil_unggah_tingkat_jk.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="thjk::dl_log_general"
+                )
+
+        # ===== Jalur 2: Template Penyandang Perempuan =====
+        if is_female:
+            df_fp = raw.rename(columns=FEMALE_ALIAS).copy()
+
+            st.caption("Pratinjau 20 baris pertama dari file yang diunggah (Penyandang Perempuan):")
+            st.dataframe(raw.head(20), use_container_width=True)
+
+            if st.button("🚀 Proses & Simpan (Penyandang Perempuan)", type="primary", key="thjk::process_female"):
+                hmhi_map, _ = load_hmhi_to_kode()
+                results_f = []
+
+                for i in range(len(df_fp)):
+                    try:
+                        s = df_fp.iloc[i]
+                        hmhi = str((s.get("hmhi_cabang") or "")).strip()
+                        if not hmhi:
+                            raise ValueError("Kolom 'HMHI Cabang' kosong.")
+                        kode_organisasi = hmhi_map.get(hmhi)
+                        if not kode_organisasi:
+                            raise ValueError(f"HMHI Cabang '{hmhi}' tidak ditemukan di identitas_organisasi.")
+
+                        jenis = str((s.get("jenis_hemofilia") or "")).strip()
+                        if jenis not in ["Hemofilia A perempuan", "Hemofilia B perempuan"]:
+                            raise ValueError("Kolom 'Jenis Hemofilia' harus 'Hemofilia A perempuan' atau 'Hemofilia B perempuan'.")
+
+                        carrier = _to_nonneg_int(s.get("carrier"))
+                        ringan  = _to_nonneg_int(s.get("ringan"))
+                        sedang  = _to_nonneg_int(s.get("sedang"))
+                        berat   = _to_nonneg_int(s.get("berat"))
+
+                        # Jika tabel sudah ditambah kolom kode_organisasi, pakai kolom itu.
+                        try:
+                            exec_sql(
+                                text("""
+                                    INSERT INTO public.hemofilia_perempuan
+                                        (kode_organisasi, jenis_hemofilia, carrier, ringan, sedang, berat)
+                                    VALUES
+                                        (:kode_organisasi, :jenis_hemofilia, :carrier, :ringan, :sedang, :berat)
+                                """),
+                                {
+                                    "kode_organisasi": kode_organisasi,
+                                    "jenis_hemofilia": jenis,
+                                    "carrier": carrier,
+                                    "ringan": ringan,
+                                    "sedang": sedang,
+                                    "berat": berat,
+                                }
+                            )
+                        except Exception:
+                            # fallback jika kolom kode_organisasi belum ada
+                            exec_sql(
+                                text("""
+                                    INSERT INTO public.hemofilia_perempuan
+                                        (jenis_hemofilia, carrier, ringan, sedang, berat)
+                                    VALUES
+                                        (:jenis_hemofilia, :carrier, :ringan, :sedang, :berat)
+                                """),
+                                {
+                                    "jenis_hemofilia": jenis,
+                                    "carrier": carrier,
+                                    "ringan": ringan,
+                                    "sedang": sedang,
+                                    "berat": berat,
+                                }
+                            )
+
+                        results_f.append({"Baris Excel": i + 2, "Status": "OK", "Keterangan": f"Simpan → {hmhi} / {jenis}"})
+                    except Exception as e:
+                        results_f.append({"Baris Excel": i + 2, "Status": "GAGAL", "Keterangan": str(e)})
+
+                res_df_f = pd.DataFrame(results_f)
+                st.write("**Hasil unggah (Penyandang Perempuan):**")
+                st.dataframe(res_df_f, use_container_width=True)
+
+                ok = (res_df_f["Status"] == "OK").sum()
+                fail = (res_df_f["Status"] == "GAGAL").sum()
+                if ok:
+                    st.success(f"Berhasil menyimpan {ok} baris.")
+                if fail:
+                    st.error(f"Gagal menyimpan {fail} baris.")
+
+                log_buf_f = io.BytesIO()
+                with pd.ExcelWriter(log_buf_f, engine="xlsxwriter") as w:
+                    res_df_f.to_excel(w, index=False, sheet_name="Hasil")
+                st.download_button(
+                    "📄 Unduh Log Hasil (Penyandang Perempuan)",
+                    log_buf_f.getvalue(),
+                    file_name="log_hasil_unggah_penyandang_perempuan.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="thjk::dl_log_female"
+                )
